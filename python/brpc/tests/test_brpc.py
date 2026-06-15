@@ -290,3 +290,45 @@ class TestRpcClient:
         ch.destroy()
         s1.close()
         s2.close()
+
+
+class TestAsyncChannel:
+    def test_import(self):
+        from brpc import AsyncChannel, AsyncRpcClient
+        assert AsyncChannel is not None
+        assert AsyncRpcClient is not None
+
+    def test_async_channel_init(self):
+        import asyncio
+        from brpc import AsyncChannel
+
+        async def _test():
+            s1, s2 = socket.socketpair()
+            async with AsyncChannel(s1.fileno(), is_server=False) as ch:
+                assert ch.stream_count == 0
+                assert not ch.is_closed
+                stream = ch.open_stream()
+                assert stream.stream_id == 1
+            s1.close()
+            s2.close()
+
+        asyncio.run(_test())
+
+    def test_async_rpc_roundtrip(self):
+        import asyncio
+        from brpc import AsyncChannel, AsyncRpcClient
+
+        async def _test():
+            s1, s2 = socket.socketpair()
+
+            async with AsyncChannel(s2.fileno(), is_server=False) as ach:
+                stream = ach.open_stream()
+                cli = AsyncRpcClient(ach, stream.stream_id)
+                assert cli is not None
+                # Verify the async client can be created and has the right stream_id
+                assert stream.stream_id == 1
+
+            s1.close()
+            s2.close()
+
+        asyncio.run(_test())

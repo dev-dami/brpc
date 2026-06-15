@@ -39,6 +39,7 @@ extern "C" {
 #define BRPC_RPC_ERROR_PARAMS      -32602
 #define BRPC_RPC_ERROR_INTERNAL    -32603
 #define BRPC_RPC_ERROR_SERVER      -32000
+#define BRPC_RPC_ERROR_TIMEOUT     -32001
 
 /* --------------------------------------------------------------------------
  * Request / Response
@@ -168,6 +169,19 @@ int brpc_rpc_call(brpc_rpc_client_t *cli, const char *method,
                   const char *params, char *resp_buf, size_t buf_len);
 
 /**
+ * Call a remote method with a timeout (milliseconds).
+ *
+ * Like brpc_rpc_call(), but returns BRPC_RPC_ERROR_TIMEOUT if no
+ * response is received within `timeout_ms`.
+ *
+ * @return 0 on success, BRPC_RPC_ERROR_TIMEOUT on timeout,
+ *         negative error code on other failure.
+ */
+int brpc_rpc_call_timeout(brpc_rpc_client_t *cli, const char *method,
+                          const char *params, char *resp_buf, size_t buf_len,
+                          int timeout_ms);
+
+/**
  * Call a remote method with json_value_t params (ergonomic API).
  *
  * Serializes params to JSON, sends the request, waits for response,
@@ -193,6 +207,14 @@ int brpc_rpc_call_json(brpc_rpc_client_t *cli, const char *method,
  */
 int brpc_rpc_notify(brpc_rpc_client_t *cli, const char *method,
                     const char *params);
+
+/**
+ * Cancel an in-flight RPC by sending RST_STREAM.
+ * The stream is closed and the peer is notified of the cancellation.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int brpc_rpc_cancel(brpc_rpc_client_t *cli);
 
 /* --------------------------------------------------------------------------
  * Helpers

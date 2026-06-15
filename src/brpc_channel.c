@@ -32,6 +32,116 @@
  * -------------------------------------------------------------------------- */
 
 /**
+ * Write a 32-bit unsigned integer in little-endian byte order at `dst`.
+ */
+static inline void write_le32_settings(uint8_t *dst, uint32_t val)
+{
+    dst[0] = (uint8_t)(val);
+    dst[1] = (uint8_t)(val >> 8);
+    dst[2] = (uint8_t)(val >> 16);
+    dst[3] = (uint8_t)(val >> 24);
+}
+
+/**
+ * Write a 16-bit unsigned integer in little-endian byte order at `dst`.
+ */
+static inline void write_le16_settings(uint8_t *dst, uint16_t val)
+{
+    dst[0] = (uint8_t)(val);
+    dst[1] = (uint8_t)(val >> 8);
+}
+
+/**
+ * Read a 32-bit unsigned integer in little-endian byte order from `src`.
+ */
+static inline uint32_t read_le32_settings(const uint8_t *src)
+{
+    return (uint32_t)src[0]
+         | ((uint32_t)src[1] << 8)
+         | ((uint32_t)src[2] << 16)
+         | ((uint32_t)src[3] << 24);
+}
+
+/**
+ * Read a 16-bit unsigned integer in little-endian byte order from `src`.
+ */
+static inline uint16_t read_le16_settings(const uint8_t *src)
+{
+    return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
+
+/**
+ * Send a SETTINGS frame advertising our local settings.
+ */
+int brpc_channel_send_settings(brpc_channel_t *ch)
+{
+    /*
+     * SETTINGS payload: sequence of key-value pairs.
+     * Each pair: LE16 key + LE32 value = 6 bytes.
+     */
+    uint8_t payload[24];  /* 4 pairs × 6 bytes */
+    int off = 0;
+
+    /* MAX_STREAMS */
+    write_le16_settings(payload + off, BRPC_SETTINGS_MAX_STREAMS);
+    write_le32_settings(payload + off + 2, ch->max_streams);
+    off += 6;
+
+    /* WINDOW_SIZE */
+    write_le16_settings(payload + off, BRPC_SETTINGS_WINDOW_SIZE);
+    write_le32_settings(payload + off + 2, ch->initial_window_size);
+    off += 6;
+
+    /* PROTOCOL_VERSION */
+    write_le16_settings(payload + off, BRPC_SETTINGS_PROTOCOL_VERSION);
+    write_le32_settings(payload + off + 2, BRPC_PROTOCOL_VERSION);
+    off += 6;
+
+    brpc_frame_t frame;
+    frame.stream_id     = 0;
+    frame.type           = BRPC_FRAME_SETTINGS;
+    frame.flags          = 0;
+    frame.payload_length = (uint32_t)off;
+    frame.payload        = payload;
+
+    return brpc_channel_send_frame(ch, &frame);
+}
+
+/**
+ * Parse a SETTINGS frame payload and apply remote settings.
+ */
+static int parse_settings(brpc_channel_t *ch, const uint8_t *payload,
+                           uint32_t length)
+{
+    size_t off = 0;
+
+    while (off + 6 <= length) {
+        uint16_t key = read_le16_settings(payload + off);
+        uint32_t val = read_le32_settings(payload + off + 2);
+        off += 6;
+
+        switch (key) {
+        case BRPC_SETTINGS_MAX_STREAMS:
+            /* Respect remote's limit if smaller. */
+            if (val < ch->max_streams) {
+                ch->max_streams = val;
+            }
+            break;
+        case BRPC_SETTINGS_WINDOW_SIZE:
+            ch->initial_window_size = val;
+            break;
+        case BRPC_SETTINGS_PROTOCOL_VERSION:
+            ch->protocol_version = val;
+            break;
+        default:
+            break;  /* Ignore unknown keys. */
+        }
+    }
+
+    return 0;
+}
+
+/**
  * Write exactly `len` bytes from `buf` to `fd`, retrying on EINTR.
  * Returns 0 on success, -1 on error.
  */
@@ -137,15 +247,46 @@ static int dispatch_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
 
         /* Push payload into stream recv buffer. */
         if (frame->payload_length > 0) {
-            size_t pushed = stream_recv_push(s, frame->payload,
-                                             frame->payload_length);
+            const uint8_t *payload = frame->payload;
+            uint32_t payload_len = frame->payload_length;
+
+#ifndef BRPC_NO_COMPRESSION
+            /* Decompress if COMPRESSED flag is set. */
+            uint8_t  decomp_buf[BRPC_FRAME_MAX_PAYLOAD_SIZE > 65536
+                                ? 65536 : BRPC_FRAME_MAX_PAYLOAD_SIZE];
+            uint8_t *decomp_ptr = decomp_buf;
+            int      decomp_heap = 0;
+
+            if (frame->flags & BRPC_FLAG_COMPRESSED) {
+                size_t decomp_len = sizeof(decomp_buf);
+                if (decomp_len < (size_t)payload_len * 4) {
+                    decomp_len = (size_t)payload_len * 4;
+                }
+                if (decomp_len > sizeof(decomp_buf)) {
+                    decomp_ptr = (uint8_t *)malloc(decomp_len);
+                    if (!decomp_ptr) return -1;
+                    decomp_heap = 1;
+                }
+                if (brpc_decompress_zlib(payload, payload_len,
+                                         decomp_ptr, &decomp_len) == 0) {
+                    payload = decomp_ptr;
+                    payload_len = (uint32_t)decomp_len;
+                }
+                /* If decompression fails, use original (will likely fail downstream). */
+            }
+#endif
+
+            size_t pushed = stream_recv_push(s, payload, payload_len);
             /* Adjust receive window. */
             s->recv_window -= (int32_t)pushed;
 
+#ifndef BRPC_NO_COMPRESSION
+            if (decomp_heap) free(decomp_ptr);
+#endif
+
             /* Invoke data callback. */
             if (s->on_data) {
-                s->on_data(s, frame->payload, frame->payload_length,
-                           s->user_ctx);
+                s->on_data(s, payload, payload_len, s->user_ctx);
             }
         }
 
@@ -155,6 +296,9 @@ static int dispatch_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
                 s->state = BRPC_STREAM_HALF_CLOSED_REMOTE;
             } else if (s->state == BRPC_STREAM_HALF_CLOSED_LOCAL) {
                 s->state = BRPC_STREAM_CLOSED;
+                if (s->on_close) {
+                    s->on_close(s, s->user_ctx);
+                }
             }
             if (s->on_end) {
                 s->on_end(s, s->user_ctx);
@@ -186,6 +330,9 @@ static int dispatch_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
                 s->state = BRPC_STREAM_HALF_CLOSED_REMOTE;
             } else if (s->state == BRPC_STREAM_HALF_CLOSED_LOCAL) {
                 s->state = BRPC_STREAM_CLOSED;
+                if (s->on_close) {
+                    s->on_close(s, s->user_ctx);
+                }
             }
             if (s->on_end) {
                 s->on_end(s, s->user_ctx);
@@ -212,17 +359,18 @@ static int dispatch_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
         if (s->on_error) {
             s->on_error(s, error_code, s->user_ctx);
         }
+        if (s->on_close) {
+            s->on_close(s, s->user_ctx);
+        }
         break;
     }
 
     /* ------------------------------------------------------------------ */
     case BRPC_FRAME_SETTINGS: {
-        /*
-         * Connection-level settings.  In a full implementation we'd
-         * parse key-value setting pairs from the payload.  For now we
-         * just acknowledge receipt.
-         */
-        (void)frame;  /* Placeholder — accept silently. */
+        /* Parse key-value settings from the payload. */
+        if (frame->payload_length > 0 && frame->payload) {
+            parse_settings(ch, frame->payload, frame->payload_length);
+        }
         break;
     }
 
@@ -362,6 +510,7 @@ int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server,
      * Server starts stream IDs at 2 (even).
      */
     ch->next_stream_id = is_server ? 2 : 1;
+    ch->compress       = 0;
 
     /* Allocate stream table. */
     if (max_streams == 0) max_streams = BRPC_MAX_STREAMS;
@@ -376,10 +525,12 @@ int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server,
     ch->conn_buf_len  = 0;
 
     ch->initial_window_size    = BRPC_DEFAULT_WINDOW_SIZE;
+    ch->protocol_version       = BRPC_PROTOCOL_VERSION;
     ch->stream_count           = 0;
     ch->closed                 = 0;
 
     ch->on_new_stream = NULL;
+    ch->on_disconnect = NULL;
     ch->user_ctx      = NULL;
 
     return 0;
@@ -528,6 +679,9 @@ int brpc_channel_recv(brpc_channel_t *ch)
     if (n == 0) {
         /* Peer closed the connection. */
         ch->closed = 1;
+        if (ch->on_disconnect) {
+            ch->on_disconnect(ch, ch->user_ctx);
+        }
         return -1;
     }
 
@@ -559,6 +713,9 @@ int brpc_channel_pump(brpc_channel_t *ch)
     }
     if (n == 0) {
         ch->closed = 1;
+        if (ch->on_disconnect) {
+            ch->on_disconnect(ch, ch->user_ctx);
+        }
         return -1;
     }
 
@@ -596,7 +753,41 @@ int brpc_channel_send_data(brpc_channel_t *ch, uint32_t stream_id,
         frame.flags |= BRPC_FLAG_END_STREAM;
     }
 
+    /*
+     * Compress the payload if compression is enabled.
+     * We compress into a stack buffer for small payloads, or heap for large.
+     */
+#ifndef BRPC_NO_COMPRESSION
+    uint8_t  comp_stack[8192];
+    uint8_t *comp_buf = comp_stack;
+    int      comp_heap = 0;
+
+    if (ch->compress && len > 64) {
+        size_t max_comp = brpc_compress_max_size(len);
+        if (max_comp > sizeof(comp_stack)) {
+            comp_buf = (uint8_t *)malloc(max_comp);
+            if (!comp_buf) return -1;
+            comp_heap = 1;
+        }
+        size_t comp_len = max_comp;
+        if (brpc_compress_zlib(data, len, comp_buf, &comp_len) == 0) {
+            /* Only use compressed version if it's smaller. */
+            if (comp_len < len) {
+                frame.payload = comp_buf;
+                frame.payload_length = (uint32_t)comp_len;
+                frame.flags |= BRPC_FLAG_COMPRESSED;
+            }
+        }
+        /* If compression failed or didn't help, use original data. */
+    }
+#endif
+
     int rc = brpc_channel_send_frame(ch, &frame);
+
+#ifndef BRPC_NO_COMPRESSION
+    if (comp_heap) free(comp_buf);
+#endif
+
     if (rc != 0) return -1;
 
     /* Debit flow-control window. */
@@ -671,6 +862,41 @@ int brpc_channel_send_goaway(brpc_channel_t *ch, uint32_t last_stream_id,
     return rc;
 }
 
+int brpc_channel_send_rst(brpc_channel_t *ch, uint32_t stream_id,
+                          uint32_t error_code)
+{
+    if (!ch || ch->closed) return -1;
+
+    /*
+     * RST_STREAM payload: 4-byte LE32 error code.
+     */
+    uint8_t payload[4];
+    payload[0] = (uint8_t)(error_code);
+    payload[1] = (uint8_t)(error_code >> 8);
+    payload[2] = (uint8_t)(error_code >> 16);
+    payload[3] = (uint8_t)(error_code >> 24);
+
+    brpc_frame_t frame;
+    frame.stream_id     = stream_id;
+    frame.type           = BRPC_FRAME_RST_STREAM;
+    frame.flags          = 0;
+    frame.payload_length = 4;
+    frame.payload        = payload;
+
+    int rc = brpc_channel_send_frame(ch, &frame);
+
+    /* Also mark the local stream as closed. */
+    brpc_stream_t *s = brpc_channel_find_stream(ch, stream_id);
+    if (s) {
+        s->state = BRPC_STREAM_CLOSED;
+        if (s->on_close) {
+            s->on_close(s, s->user_ctx);
+        }
+    }
+
+    return rc;
+}
+
 int brpc_channel_close(brpc_channel_t *ch)
 {
     /*
@@ -678,4 +904,36 @@ int brpc_channel_close(brpc_channel_t *ch)
      * processed after this point", error_code = 0 means no error.
      */
     return brpc_channel_send_goaway(ch, 0, 0);
+}
+
+/* --------------------------------------------------------------------------
+ * Event-loop integration
+ * -------------------------------------------------------------------------- */
+
+int brpc_channel_fd(const brpc_channel_t *ch)
+{
+    return ch ? ch->fd : -1;
+}
+
+void brpc_channel_set_compress(brpc_channel_t *ch, int enabled)
+{
+    if (ch) ch->compress = enabled;
+}
+
+int brpc_channel_wants_read(const brpc_channel_t *ch)
+{
+    if (!ch || ch->closed) return 0;
+    return ch->conn_buf_len < ch->conn_buf_size;
+}
+
+int brpc_channel_wants_write(const brpc_channel_t *ch)
+{
+    (void)ch;
+    /*
+     * brpc currently writes directly to the fd in brpc_channel_send_data(),
+     * so there is no outgoing buffer to flush.  This returns 0 for now.
+     * When send-side buffering is added, this should check whether any
+     * stream has pending outgoing data.
+     */
+    return 0;
 }

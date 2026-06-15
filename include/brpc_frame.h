@@ -65,6 +65,22 @@ extern "C" {
 #define BRPC_FRAME_WINDOW_UPDATE 0x06
 
 /* --------------------------------------------------------------------------
+ * Protocol version
+ * -------------------------------------------------------------------------- */
+
+/** Current protocol version. Increment on wire-format changes. */
+#define BRPC_PROTOCOL_VERSION     1
+
+/* --------------------------------------------------------------------------
+ * SETTINGS keys (for SETTINGS frame payload)
+ * -------------------------------------------------------------------------- */
+
+#define BRPC_SETTINGS_MAX_STREAMS      0x01
+#define BRPC_SETTINGS_MAX_FRAME_SIZE   0x02
+#define BRPC_SETTINGS_WINDOW_SIZE      0x03
+#define BRPC_SETTINGS_PROTOCOL_VERSION 0x04
+
+/* --------------------------------------------------------------------------
  * Frame flags (bitfield)
  * -------------------------------------------------------------------------- */
 

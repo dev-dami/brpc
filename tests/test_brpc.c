@@ -4,6 +4,8 @@
 #include "brpc_channel.h"
 #include "brpc_rpc.h"
 #include "brpc_prof.h"
+#include "brpc_compress.h"
+#include "brpc_tls.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +13,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -697,15 +700,48 @@ static void test_channel_send_data(void) {
     } else { FAIL("should fail on closed channel"); }
 
     TEST("send data on non-existent stream fails");
+    if (brpc_channel_send_data(&ch, 999, (const uint8_t *)"x", 1, 0) == -1) {
+        PASS();
+    } else { FAIL("should fail on non-existent stream"); }
+
+    /* --- Event-loop integration tests --- */
+
+    TEST("channel_fd returns socket fd");
     brpc_channel_t ch2;
     brpc_channel_init(&ch2, sv[1], 1, 0);
-    if (brpc_channel_send_data(&ch2, 999,
-                               (const uint8_t *)"x", 1, 0) == -1) {
+    if (brpc_channel_fd(&ch2) == sv[1]) {
         PASS();
-    } else { FAIL("should fail on bad stream id"); }
+    } else { FAIL("fd mismatch"); }
 
-    brpc_channel_destroy(&ch);
+    TEST("channel_fd returns -1 for NULL");
+    if (brpc_channel_fd(NULL) == -1) {
+        PASS();
+    } else { FAIL("should return -1"); }
+
+    TEST("wants_read true when buffer has space");
+    if (brpc_channel_wants_read(&ch2)) {
+        PASS();
+    } else { FAIL("should want read on fresh channel"); }
+
+    TEST("wants_read false when closed");
+    brpc_channel_close(&ch2);
+    if (!brpc_channel_wants_read(&ch2)) {
+        PASS();
+    } else { FAIL("should not want read when closed"); }
+
+    TEST("wants_write returns 0 (no send buffering)");
+    brpc_channel_init(&ch2, sv[1], 1, 0);
+    if (!brpc_channel_wants_write(&ch2)) {
+        PASS();
+    } else { FAIL("should return 0"); }
+
+    TEST("wants_read false for NULL channel");
+    if (!brpc_channel_wants_read(NULL)) {
+        PASS();
+    } else { FAIL("should return 0 for NULL"); }
+
     brpc_channel_destroy(&ch2);
+    brpc_channel_destroy(&ch);
     close(sv[0]);
     close(sv[1]);
 }
@@ -831,6 +867,16 @@ static int handler_fail(const brpc_rpc_request_t *req,
     resp->error_code = BRPC_RPC_ERROR_INTERNAL;
     resp->error_message = "Intentional failure";
     return BRPC_RPC_ERROR_INTERNAL;
+}
+
+static void dummy_close_cb(brpc_stream_t *s, void *ctx) {
+    (void)s;
+    *(int *)ctx = 1;
+}
+
+static void dummy_disconnect_cb(brpc_channel_t *ch, void *ctx) {
+    (void)ch;
+    *(int *)ctx = 1;
 }
 
 static void test_rpc(void)
@@ -967,6 +1013,288 @@ static void test_rpc(void)
     brpc_channel_destroy(&cli_ch);
     close(sv2[0]);
     close(sv2[1]);
+
+    /* Test RPC call timeout. */
+    TEST("rpc call timeout");
+    int sv3[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv3);
+    brpc_channel_t to_ch;
+    brpc_channel_init(&to_ch, sv3[0], 0, 0);
+    brpc_stream_t *to_s = brpc_channel_open_stream(&to_ch);
+    brpc_rpc_client_t to_cli;
+    brpc_rpc_client_init(&to_cli, &to_ch, to_s->stream_id);
+
+    /* Send request but never respond — should timeout. */
+    const char *to_req = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":99}";
+    brpc_channel_send_data(&to_ch, to_s->stream_id,
+                           (const uint8_t *)to_req, strlen(to_req), 0);
+
+    char to_resp[256];
+    rc = brpc_rpc_call_timeout(&to_cli, "ping", NULL,
+                               to_resp, sizeof(to_resp), 50);
+    if (rc == BRPC_RPC_ERROR_TIMEOUT) {
+        PASS();
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected TIMEOUT (-32001), got %d", rc);
+        FAIL(msg);
+    }
+
+    brpc_channel_destroy(&to_ch);
+    close(sv3[0]);
+    close(sv3[1]);
+
+    /* Test stream reset. */
+    TEST("channel send rst");
+    int sv4[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv4);
+    brpc_channel_t rst_ch;
+    brpc_channel_init(&rst_ch, sv4[0], 0, 0);
+    brpc_stream_t *rst_s = brpc_channel_open_stream(&rst_ch);
+    uint32_t rst_sid = rst_s->stream_id;
+
+    rc = brpc_channel_send_rst(&rst_ch, rst_sid, 42);
+    if (rc == 0 && rst_s->state == BRPC_STREAM_CLOSED) {
+        PASS();
+    } else { FAIL("send_rst failed"); }
+
+    TEST("stream reset closes stream");
+    brpc_stream_t rst_s2;
+    brpc_stream_init(&rst_s2, 5, 1024);
+    brpc_stream_reset(&rst_s2, 99);
+    if (rst_s2.state == BRPC_STREAM_CLOSED) {
+        PASS();
+    } else { FAIL("stream_reset should close stream"); }
+
+    TEST("stream send_window returns default");
+    brpc_stream_t bw_s;
+    brpc_stream_init(&bw_s, 10, 1024);
+    if (brpc_stream_send_window(&bw_s) == BRPC_STREAM_DEFAULT_WINDOW) {
+        PASS();
+    } else { FAIL("send_window should be default"); }
+
+    TEST("stream is_writable on open stream");
+    if (brpc_stream_is_writable(&bw_s)) {
+        PASS();
+    } else { FAIL("open stream should be writable"); }
+
+    TEST("stream is_writable false after close");
+    brpc_stream_close(&bw_s);
+    if (!brpc_stream_is_writable(&bw_s)) {
+        PASS();
+    } else { FAIL("closed stream should not be writable"); }
+
+    TEST("stream send_window returns 0 for NULL");
+    if (brpc_stream_send_window(NULL) == 0) {
+        PASS();
+    } else { FAIL("NULL should return 0"); }
+
+    brpc_stream_destroy(&bw_s);
+
+    /* Test lifecycle callbacks. */
+    static int close_called = 0;
+    static int disconnect_called = 0;
+
+    TEST("on_close callback fires on rst");
+    close_called = 0;
+    brpc_stream_t cb_s;
+    brpc_stream_init(&cb_s, 20, 1024);
+    cb_s.on_close = (void (*)(brpc_stream_t *, void *))dummy_close_cb;
+    cb_s.user_ctx = &close_called;
+    brpc_stream_reset(&cb_s, 0);
+    if (close_called) {
+        PASS();
+    } else { FAIL("on_close not called"); }
+
+    TEST("on_disconnect callback fires");
+    disconnect_called = 0;
+    int sv5[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv5);
+    brpc_channel_t dc_ch;
+    brpc_channel_init(&dc_ch, sv5[0], 0, 0);
+    dc_ch.on_disconnect = (void (*)(brpc_channel_t *, void *))dummy_disconnect_cb;
+    dc_ch.user_ctx = &disconnect_called;
+    close(sv5[1]);  /* Close remote end so recv sees EOF. */
+    brpc_channel_recv(&dc_ch);
+    if (disconnect_called) {
+        PASS();
+    } else { FAIL("on_disconnect not called"); }
+    brpc_channel_destroy(&dc_ch);
+    close(sv5[0]);
+
+    /* Test SETTINGS frame. */
+    TEST("channel send settings");
+    int sv6[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv6);
+    brpc_channel_t set_ch;
+    brpc_channel_init(&set_ch, sv6[0], 0, 0);
+    rc = brpc_channel_send_settings(&set_ch);
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("send_settings failed"); }
+
+    TEST("settings frame round-trips");
+    /* Read the SETTINGS frame on the other end. */
+    brpc_channel_t set_ch2;
+    brpc_channel_init(&set_ch2, sv6[1], 1, 0);
+    brpc_channel_recv(&set_ch2);
+    /* After recv, protocol_version should be set from the SETTINGS. */
+    if (set_ch2.protocol_version == BRPC_PROTOCOL_VERSION) {
+        PASS();
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected version %d, got %d",
+                 BRPC_PROTOCOL_VERSION, set_ch2.protocol_version);
+        FAIL(msg);
+    }
+    brpc_channel_destroy(&set_ch);
+    brpc_channel_destroy(&set_ch2);
+    close(sv6[0]);
+    close(sv6[1]);
+}
+
+/* ========================================================================
+ * Compression Tests
+ * ======================================================================== */
+
+static void test_compression(void)
+{
+    TEST("compress/decompress round-trip");
+    const char *original = "Hello, brpc compression! This is a test payload that should compress well due to repetition. AAAABBBBCCCCDDDD.";
+    size_t orig_len = strlen(original);
+
+    size_t max_comp = brpc_compress_max_size(orig_len);
+    uint8_t *comp_buf = (uint8_t *)malloc(max_comp);
+    uint8_t *decomp_buf = (uint8_t *)malloc(orig_len + 256);
+
+    size_t comp_len = max_comp;
+    int rc = brpc_compress_zlib((const uint8_t *)original, orig_len,
+                                comp_buf, &comp_len);
+    if (rc == 0 && comp_len < orig_len) {
+        PASS();
+    } else { FAIL("compress failed or no benefit"); }
+
+    TEST("decompress restores original");
+    size_t decomp_len = orig_len + 256;
+    rc = brpc_decompress_zlib(comp_buf, comp_len, decomp_buf, &decomp_len);
+    if (rc == 0 && decomp_len == orig_len &&
+        memcmp(decomp_buf, original, orig_len) == 0) {
+        PASS();
+    } else { FAIL("decompress mismatch"); }
+
+    TEST("channel send with compression");
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    brpc_channel_t ch;
+    brpc_channel_init(&ch, sv[0], 0, 0);
+    brpc_channel_set_compress(&ch, 1);
+    brpc_stream_t *s = brpc_channel_open_stream(&ch);
+
+    rc = brpc_channel_send_data(&ch, s->stream_id,
+                                (const uint8_t *)original, orig_len, 0);
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("send with compress failed"); }
+
+    TEST("compressed frame received and decompressed");
+    brpc_channel_t srv_ch;
+    brpc_channel_init(&srv_ch, sv[1], 1, 0);
+    brpc_channel_recv(&srv_ch);
+
+    brpc_stream_t *srv_s = brpc_channel_find_stream(&srv_ch, s->stream_id);
+    if (srv_s) {
+        size_t avail = brpc_stream_available_read(srv_s);
+        if (avail == orig_len) {
+            char recv_buf[512];
+            brpc_stream_read(srv_s, (uint8_t *)recv_buf, avail);
+            if (memcmp(recv_buf, original, orig_len) == 0) {
+                PASS();
+            } else { FAIL("decompressed data mismatch"); }
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "expected %zu bytes, got %zu", orig_len, avail);
+            FAIL(msg);
+        }
+    } else { FAIL("server stream not found"); }
+
+    free(comp_buf);
+    free(decomp_buf);
+    brpc_channel_destroy(&ch);
+    brpc_channel_destroy(&srv_ch);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* ========================================================================
+ * TLS Tests
+ * ======================================================================== */
+
+static void test_tls(void)
+{
+    TEST("tls init and shutdown");
+    if (brpc_tls_init() == 0) {
+        PASS();
+    } else { FAIL("tls_init failed"); }
+
+    TEST("tls client context (no verification)");
+    brpc_tls_ctx_t *cli_ctx = brpc_tls_ctx_create_client(NULL, NULL);
+    if (cli_ctx != NULL) {
+        PASS();
+    } else { FAIL("client ctx failed"); }
+
+    TEST("tls server context (self-signed)");
+    system("openssl req -x509 -newkey rsa:2048 -keyout /tmp/test_key.pem "
+           "-out /tmp/test_cert.pem -days 1 -nodes "
+           "-subj '/CN=localhost' 2>/dev/null");
+
+    brpc_tls_ctx_t *srv_ctx = brpc_tls_ctx_create_server(
+        "/tmp/test_cert.pem", "/tmp/test_key.pem");
+    if (srv_ctx != NULL) {
+        PASS();
+    } else { FAIL("server ctx failed"); }
+
+    TEST("tls error string");
+    const char *err = brpc_tls_error_string();
+    if (err != NULL) {
+        PASS();
+    } else { FAIL("error_string returned NULL"); }
+
+    TEST("tls client context NULL CA");
+    /* No CA = no verification, should succeed. */
+    brpc_tls_ctx_t *ctx2 = brpc_tls_ctx_create_client(NULL, NULL);
+    if (ctx2 != NULL) {
+        PASS();
+    } else { FAIL("NULL CA ctx failed"); }
+
+    TEST("tls connect returns NULL on bad fd");
+    brpc_tls_t *tls_bad = brpc_tls_connect(cli_ctx, -1, "localhost");
+    if (tls_bad == NULL) {
+        PASS();
+    } else {
+        brpc_tls_free(tls_bad);
+        FAIL("should return NULL for bad fd");
+    }
+
+    TEST("tls accept returns NULL on bad fd");
+    brpc_tls_t *tls_bad2 = brpc_tls_accept(srv_ctx, -1);
+    if (tls_bad2 == NULL) {
+        PASS();
+    } else {
+        brpc_tls_free(tls_bad2);
+        FAIL("should return NULL for bad fd");
+    }
+
+    TEST("tls fd accessor NULL");
+    if (brpc_tls_fd(NULL) == -1) {
+        PASS();
+    } else { FAIL("NULL should return -1"); }
+
+    brpc_tls_ctx_destroy(cli_ctx);
+    brpc_tls_ctx_destroy(srv_ctx);
+    brpc_tls_ctx_destroy(ctx2);
+
+    remove("/tmp/test_cert.pem");
+    remove("/tmp/test_key.pem");
 }
 
 /* ========================================================================
@@ -999,6 +1327,12 @@ int main(void) {
 
     printf("\n=== RPC Tests ===\n");
     test_rpc();
+
+    printf("\n=== Compression Tests ===\n");
+    test_compression();
+
+    printf("\n=== TLS Tests ===\n");
+    test_tls();
 
     printf("\n--- Results: %d/%d passed ---\n", tests_passed, tests_run);
 

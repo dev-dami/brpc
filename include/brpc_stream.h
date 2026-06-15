@@ -90,6 +90,12 @@ typedef struct brpc_stream {
      */
     void (*on_error)(struct brpc_stream *s, int code, void *ctx);
 
+    /**
+     * Called when the stream transitions to CLOSED state (via END_STREAM,
+     * RST_STREAM, or local close).
+     */
+    void (*on_close)(struct brpc_stream *s, void *ctx);
+
     /** Opaque pointer forwarded to all callbacks. */
     void *user_ctx;
 } brpc_stream_t;
@@ -142,6 +148,26 @@ size_t brpc_stream_available_read(const brpc_stream_t *s);
  * Return the number of free bytes available for writing.
  */
 size_t brpc_stream_available_write(const brpc_stream_t *s);
+
+/**
+ * Return the current send window (bytes the peer allows us to send).
+ * When this reaches 0, the sender must wait for a WINDOW_UPDATE frame.
+ */
+int32_t brpc_stream_send_window(const brpc_stream_t *s);
+
+/**
+ * Returns non-zero if the stream can accept data for writing.
+ * Checks both ring buffer space and flow-control window.
+ */
+int brpc_stream_is_writable(const brpc_stream_t *s);
+
+/**
+ * Reset the stream with an error code, transitioning it to CLOSED.
+ * This is a local-only operation — the caller must also send a
+ * RST_STREAM frame via brpc_channel_send_rst() if they want to
+ * notify the peer.
+ */
+void brpc_stream_reset(brpc_stream_t *s, int error_code);
 
 #ifdef __cplusplus
 }

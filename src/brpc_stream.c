@@ -112,6 +112,7 @@ int brpc_stream_init(brpc_stream_t *s, uint32_t stream_id, size_t buf_size)
     s->on_data       = NULL;
     s->on_end        = NULL;
     s->on_error      = NULL;
+    s->on_close      = NULL;
     s->user_ctx      = NULL;
 
     return 0;
@@ -215,6 +216,9 @@ void brpc_stream_close(brpc_stream_t *s)
 
     case BRPC_STREAM_HALF_CLOSED_REMOTE:
         s->state = BRPC_STREAM_CLOSED;
+        if (s->on_close) {
+            s->on_close(s, s->user_ctx);
+        }
         break;
 
     case BRPC_STREAM_HALF_CLOSED_LOCAL:
@@ -236,4 +240,35 @@ size_t brpc_stream_available_write(const brpc_stream_t *s)
 {
     if (!s) return 0;
     return ring_free(s->send_head, s->send_tail, s->send_buf_size);
+}
+
+int32_t brpc_stream_send_window(const brpc_stream_t *s)
+{
+    if (!s) return 0;
+    return s->send_window;
+}
+
+int brpc_stream_is_writable(const brpc_stream_t *s)
+{
+    if (!s) return 0;
+    if (s->state != BRPC_STREAM_OPEN &&
+        s->state != BRPC_STREAM_HALF_CLOSED_REMOTE) {
+        return 0;
+    }
+    if (s->send_window <= 0) return 0;
+    return ring_free(s->send_head, s->send_tail, s->send_buf_size) > 0;
+}
+
+void brpc_stream_reset(brpc_stream_t *s, int error_code)
+{
+    if (!s) return;
+
+    s->state = BRPC_STREAM_CLOSED;
+
+    if (s->on_error) {
+        s->on_error(s, error_code, s->user_ctx);
+    }
+    if (s->on_close) {
+        s->on_close(s, s->user_ctx);
+    }
 }

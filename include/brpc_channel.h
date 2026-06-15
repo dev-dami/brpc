@@ -24,6 +24,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifndef BRPC_NO_COMPRESSION
+#include "brpc_compress.h"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -55,6 +59,7 @@ typedef struct brpc_channel {
     int            stream_count;         /**< Number of active streams.        */
     uint32_t       next_stream_id;       /**< Next ID to assign.              */
     int            is_server;            /**< Non-zero ⇒ we use even IDs.     */
+    int            compress;             /**< Non-zero ⇒ compress DATA frames. */
 
     /* ---- connection receive buffer ---- */
     uint8_t       *conn_buf;             /**< Heap-allocated accumulation buf. */
@@ -63,6 +68,7 @@ typedef struct brpc_channel {
 
     /* ---- negotiated settings ---- */
     uint32_t       initial_window_size;
+    uint32_t       protocol_version;   /**< Negotiated protocol version. */
 
     /* ---- callbacks ---- */
 
@@ -73,6 +79,12 @@ typedef struct brpc_channel {
      */
     void (*on_new_stream)(struct brpc_channel *ch, brpc_stream_t *s,
                           void *ctx);
+
+    /**
+     * Called when the channel detects a remote close (recv returns 0)
+     * or a fatal transport error.
+     */
+    void (*on_disconnect)(struct brpc_channel *ch, void *ctx);
 
     void *user_ctx;                      /**< Forwarded to callbacks.          */
 
@@ -194,11 +206,69 @@ int brpc_channel_send_goaway(brpc_channel_t *ch, uint32_t last_stream_id,
                              uint32_t error_code);
 
 /**
+ * Send a SETTINGS frame advertising local settings (max_streams,
+ * window_size, protocol_version).  Call after init to negotiate.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int brpc_channel_send_settings(brpc_channel_t *ch);
+
+/**
+ * Enable or disable compression on this channel.
+ * When enabled, DATA frames are compressed and the COMPRESSED flag
+ * is set. The receiver must also support decompression.
+ *
+ * @param ch      The channel.
+ * @param enabled Non-zero to enable compression.
+ */
+void brpc_channel_set_compress(brpc_channel_t *ch, int enabled);
+
+/**
+ * Send a RST_STREAM frame to abort a stream with an error code.
+ * The local stream is also marked as CLOSED.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int brpc_channel_send_rst(brpc_channel_t *ch, uint32_t stream_id,
+                          uint32_t error_code);
+
+/**
  * Convenience: send GOAWAY(0, 0) — a clean shutdown with no error.
  *
  * @return 0 on success, -1 on error.
  */
 int brpc_channel_close(brpc_channel_t *ch);
+
+/* --------------------------------------------------------------------------
+ * Event-loop integration
+ *
+ * These functions let you integrate brpc with epoll, kqueue, or any
+ * event-driven I/O loop.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Return the file descriptor underlying this channel.
+ * Useful for registering with epoll/kqueue.
+ */
+int brpc_channel_fd(const brpc_channel_t *ch);
+
+/**
+ * Returns non-zero if the channel would benefit from a read call
+ * (i.e., the connection buffer has space and the socket may have data).
+ *
+ * Call this before registering with your event loop to decide whether
+ * to watch for readability.
+ */
+int brpc_channel_wants_read(const brpc_channel_t *ch);
+
+/**
+ * Returns non-zero if the channel has data pending in any stream's
+ * send buffer that has not yet been written to the socket.
+ *
+ * Currently brpc writes directly to the fd, so this returns 0 unless
+ * a partial write occurred. Provided for future buffering support.
+ */
+int brpc_channel_wants_write(const brpc_channel_t *ch);
 
 #ifdef __cplusplus
 }

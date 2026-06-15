@@ -10,6 +10,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/time.h>
 
 /* --------------------------------------------------------------------------
  * Server
@@ -255,6 +258,91 @@ int brpc_rpc_call(brpc_rpc_client_t *cli, const char *method,
     return 0;
 }
 
+int brpc_rpc_call_timeout(brpc_rpc_client_t *cli, const char *method,
+                          const char *params, char *resp_buf, size_t buf_len,
+                          int timeout_ms)
+{
+    /* Build request. */
+    char req_buf[4096];
+    int req_len = brpc_rpc_build_request(req_buf, sizeof(req_buf),
+                                         method, params, "1");
+    if (req_len < 0) return -1;
+
+    /* Send request. */
+    int rc = brpc_channel_send_data(cli->ch, cli->stream_id,
+                                    (const uint8_t *)req_buf,
+                                    (size_t)req_len, 0);
+    if (rc != 0) return -1;
+
+    /* Wait for response with timeout using poll(). */
+    struct pollfd pfd;
+    pfd.fd = cli->ch->fd;
+    pfd.events = POLLIN;
+
+    int remaining_ms = timeout_ms;
+    uint64_t deadline = 0;
+
+    if (timeout_ms > 0) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        deadline = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL
+                   + (uint64_t)timeout_ms;
+    }
+
+    for (;;) {
+        int poll_rc = poll(&pfd, 1, remaining_ms);
+        if (poll_rc < 0) {
+            if (errno == EINTR) {
+                /* Recompute remaining time. */
+                if (timeout_ms > 0) {
+                    struct timeval tv;
+                    gettimeofday(&tv, NULL);
+                    uint64_t now = (uint64_t)tv.tv_sec * 1000ULL
+                                   + (uint64_t)tv.tv_usec / 1000ULL;
+                    if (now >= deadline) return BRPC_RPC_ERROR_TIMEOUT;
+                    remaining_ms = (int)(deadline - now);
+                }
+                continue;
+            }
+            return -1;
+        }
+        if (poll_rc == 0) {
+            /* Timeout. */
+            return BRPC_RPC_ERROR_TIMEOUT;
+        }
+
+        /* Data available — try to recv. */
+        rc = brpc_channel_recv(cli->ch);
+        if (rc != 0) return -1;
+
+        /* Check if our stream has data. */
+        brpc_stream_t *s = brpc_channel_find_stream(cli->ch, cli->stream_id);
+        if (!s) return -1;
+
+        size_t available = brpc_stream_available_read(s);
+        if (available == 0) {
+            /* Got data but not for our stream — keep waiting. */
+            if (timeout_ms > 0) {
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                uint64_t now = (uint64_t)tv.tv_sec * 1000ULL
+                               + (uint64_t)tv.tv_usec / 1000ULL;
+                if (now >= deadline) return BRPC_RPC_ERROR_TIMEOUT;
+                remaining_ms = (int)(deadline - now);
+            }
+            continue;
+        }
+
+        if (available > buf_len) return -1;
+
+        int n = brpc_stream_read(s, (uint8_t *)resp_buf, available);
+        if (n <= 0) return -1;
+
+        resp_buf[n] = '\0';
+        return 0;
+    }
+}
+
 int brpc_rpc_call_json(brpc_rpc_client_t *cli, const char *method,
                        json_value_t *params, json_arena_t *resp_arena,
                        json_value_t **result)
@@ -331,8 +419,14 @@ int brpc_rpc_notify(brpc_rpc_client_t *cli, const char *method,
     if (req_len < 0) return -1;
 
     return brpc_channel_send_data(cli->ch, cli->stream_id,
-                                  (const uint8_t *)req_buf,
-                                  (size_t)req_len, 0);
+                                   (const uint8_t *)req_buf,
+                                   (size_t)req_len, 0);
+}
+
+int brpc_rpc_cancel(brpc_rpc_client_t *cli)
+{
+    if (!cli || !cli->ch) return -1;
+    return brpc_channel_send_rst(cli->ch, cli->stream_id, 0);
 }
 
 /* --------------------------------------------------------------------------

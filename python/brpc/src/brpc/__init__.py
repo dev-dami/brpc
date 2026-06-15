@@ -1,10 +1,17 @@
 """brpc — High-performance bRPC bindings for Python (ctypes-based)."""
 import ctypes
 import os
+import select
+import time
+import asyncio
 
 __all__ = ["JsonParser", "JsonValue", "JsonWriter", "Stream", "Channel",
            "Profiler", "RpcServer", "RpcClient"]
 __version__ = "0.1.0"
+
+
+def _monotonic_ms():
+    return int(time.monotonic() * 1000)
 
 _lib_path = os.path.join(os.path.dirname(__file__), "_libbrpc.so")
 lib = ctypes.CDLL(_lib_path)
@@ -110,8 +117,14 @@ lib.brpc_stream_available_read.argtypes = [ctypes.POINTER(brpc_stream_t)]
 lib.brpc_stream_available_read.restype = ctypes.c_size_t
 lib.brpc_stream_available_write.argtypes = [ctypes.POINTER(brpc_stream_t)]
 lib.brpc_stream_available_write.restype = ctypes.c_size_t
+lib.brpc_stream_reset.argtypes = [ctypes.POINTER(brpc_stream_t), ctypes.c_int]
+lib.brpc_stream_reset.restype = None
+lib.brpc_stream_send_window.argtypes = [ctypes.POINTER(brpc_stream_t)]
+lib.brpc_stream_send_window.restype = ctypes.c_int32
+lib.brpc_stream_is_writable.argtypes = [ctypes.POINTER(brpc_stream_t)]
+lib.brpc_stream_is_writable.restype = ctypes.c_int
 
-CHANNEL_SIZE = 88  # sizeof(brpc_channel_t) with dynamic stream table
+CHANNEL_SIZE = 104  # sizeof(brpc_channel_t) with dynamic stream table
 STREAM_COUNT_OFFSET = 20  # offsetof(brpc_channel_t, stream_count)
 lib.brpc_channel_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
 lib.brpc_channel_init.restype = ctypes.c_int
@@ -126,22 +139,47 @@ lib.brpc_channel_send_ping.argtypes = [ctypes.c_void_p]
 lib.brpc_channel_send_ping.restype = ctypes.c_int
 lib.brpc_channel_close.argtypes = [ctypes.c_void_p]
 lib.brpc_channel_close.restype = ctypes.c_int
-lib.brpc_channel_recv.argtypes = [ctypes.c_void_p]
-lib.brpc_channel_recv.restype = ctypes.c_int
-lib.brpc_channel_pump.argtypes = [ctypes.c_void_p]
-lib.brpc_channel_pump.restype = ctypes.c_int
+lib.brpc_channel_send_rst.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+lib.brpc_channel_send_rst.restype = ctypes.c_int
 
-lib.brpc_channel_stream_count.argtypes = [ctypes.c_void_p]
-lib.brpc_channel_stream_count.restype = ctypes.c_int
+lib.brpc_channel_set_compress.argtypes = [ctypes.c_void_p, ctypes.c_int]
+lib.brpc_channel_set_compress.restype = None
 
-lib.brpc_channel_get_stream.argtypes = [ctypes.c_void_p, ctypes.c_int]
-lib.brpc_channel_get_stream.restype = ctypes.c_void_p
+# ── TLS ──────────────────────────────────────────────────────────────────
 
-lib.brpc_channel_next_ready_stream.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-lib.brpc_channel_next_ready_stream.restype = ctypes.c_void_p
+lib.brpc_tls_init.argtypes = []
+lib.brpc_tls_init.restype = ctypes.c_int
+lib.brpc_tls_shutdown_global.argtypes = []
+lib.brpc_tls_shutdown_global.restype = None
+lib.brpc_tls_ctx_create_client.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+lib.brpc_tls_ctx_create_client.restype = ctypes.c_void_p
+lib.brpc_tls_ctx_create_server.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+lib.brpc_tls_ctx_create_server.restype = ctypes.c_void_p
+lib.brpc_tls_ctx_destroy.argtypes = [ctypes.c_void_p]
+lib.brpc_tls_ctx_destroy.restype = None
+lib.brpc_tls_connect.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p]
+lib.brpc_tls_connect.restype = ctypes.c_void_p
+lib.brpc_tls_accept.argtypes = [ctypes.c_void_p, ctypes.c_int]
+lib.brpc_tls_accept.restype = ctypes.c_void_p
+lib.brpc_tls_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+lib.brpc_tls_read.restype = ctypes.c_int
+lib.brpc_tls_write.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+lib.brpc_tls_write.restype = ctypes.c_int
+lib.brpc_tls_close.argtypes = [ctypes.c_void_p]
+lib.brpc_tls_close.restype = ctypes.c_int
+lib.brpc_tls_free.argtypes = [ctypes.c_void_p]
+lib.brpc_tls_free.restype = None
+lib.brpc_tls_fd.argtypes = [ctypes.c_void_p]
+lib.brpc_tls_fd.restype = ctypes.c_int
+lib.brpc_tls_error_string.argtypes = []
+lib.brpc_tls_error_string.restype = ctypes.c_char_p
 
-lib.brpc_channel_is_closed.argtypes = [ctypes.c_void_p]
-lib.brpc_channel_is_closed.restype = ctypes.c_int
+lib.brpc_channel_fd.argtypes = [ctypes.c_void_p]
+lib.brpc_channel_fd.restype = ctypes.c_int
+lib.brpc_channel_wants_read.argtypes = [ctypes.c_void_p]
+lib.brpc_channel_wants_read.restype = ctypes.c_int
+lib.brpc_channel_wants_write.argtypes = [ctypes.c_void_p]
+lib.brpc_channel_wants_write.restype = ctypes.c_int
 
 lib.brpc_prof_init.argtypes = []
 lib.brpc_prof_init.restype = None
@@ -306,6 +344,14 @@ class Stream:
     def available_write(self) -> int:
         return lib.brpc_stream_available_write(self._s)
 
+    @property
+    def send_window(self) -> int:
+        return lib.brpc_stream_send_window(self._s)
+
+    @property
+    def is_writable(self) -> bool:
+        return bool(lib.brpc_stream_is_writable(self._s))
+
     def write(self, data: bytes) -> int:
         buf = ctypes.create_string_buffer(data)
         return lib.brpc_stream_write(self._s, buf, len(data))
@@ -319,6 +365,9 @@ class Stream:
 
     def close(self):
         lib.brpc_stream_close(self._s)
+
+    def reset(self, error_code: int = 0):
+        lib.brpc_stream_reset(self._s, error_code)
 
     def destroy(self):
         pass  # Stream memory is managed by Python (stack-allocated in channel)
@@ -371,11 +420,29 @@ class Channel:
     def close(self) -> int:
         return lib.brpc_channel_close(self._ch)
 
+    def send_rst(self, stream_id: int, error_code: int = 0) -> int:
+        return lib.brpc_channel_send_rst(self._ch, stream_id, error_code)
+
+    def set_compress(self, enabled: bool):
+        lib.brpc_channel_set_compress(self._ch, int(enabled))
+
     def recv(self) -> int:
         return lib.brpc_channel_recv(self._ch)
 
     def pump(self) -> int:
         return lib.brpc_channel_pump(self._ch)
+
+    @property
+    def fd(self) -> int:
+        return lib.brpc_channel_fd(self._ch)
+
+    @property
+    def wants_read(self) -> bool:
+        return bool(lib.brpc_channel_wants_read(self._ch))
+
+    @property
+    def wants_write(self) -> bool:
+        return bool(lib.brpc_channel_wants_write(self._ch))
 
     def destroy(self):
         lib.brpc_channel_destroy(self._ch)
@@ -410,6 +477,11 @@ lib.brpc_rpc_build_error.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
                                       ctypes.c_char_p, ctypes.c_int,
                                       ctypes.c_char_p]
 lib.brpc_rpc_build_error.restype = ctypes.c_int
+
+lib.brpc_rpc_call_timeout.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                       ctypes.c_char_p, ctypes.c_char_p,
+                                       ctypes.c_size_t, ctypes.c_int]
+lib.brpc_rpc_call_timeout.restype = ctypes.c_int
 
 
 def _write_value(w, val):
@@ -594,15 +666,16 @@ class RpcClient:
         self._ch = channel
         self._stream_id = stream_id
 
-    def call(self, method, params=None):
+    def call(self, method, params=None, timeout_ms=None):
         """Call a remote method and return raw JSON response.
 
         Args:
             method: Method name.
             params: Params dict/list/value (will be serialized to JSON).
+            timeout_ms: Timeout in milliseconds (None = blocking forever).
 
         Returns:
-            Raw JSON response string.
+            Raw JSON response string, or None on timeout.
         """
         # Serialize params
         params_json = None
@@ -623,17 +696,49 @@ class RpcClient:
         # Send request
         self._ch.send_data(self._stream_id, req, end_stream=False)
 
-        # Receive response
+        # If timeout specified, use poll() before recv
+        if timeout_ms is not None:
+            fd = self._ch.fd
+            deadline = _monotonic_ms() + timeout_ms
+            while True:
+                remaining = deadline - _monotonic_ms()
+                if remaining <= 0:
+                    return None
+                try:
+                    p = select.poll()
+                    p.register(fd, select.POLLIN)
+                    p.poll(remaining)
+                except Exception:
+                    return None
+                self._ch.pump()
+                stream = self._find_stream()
+                if stream and stream.available_read > 0:
+                    available = stream.available_read
+                    return stream.read(available).decode("utf-8")
+            return None
+
+        # Blocking recv
         self._ch.recv()
 
         # Read from stream
-        stream = self._ch.find_stream(self._stream_id)
+        stream = self._find_stream()
         if not stream:
             return None
         available = stream.available_read
         if available == 0:
             return None
         return stream.read(available).decode("utf-8")
+
+    def _find_stream(self):
+        """Find the C stream object for this client's stream_id."""
+        count = self._ch.stream_count
+        for i in range(count):
+            ptr = lib.brpc_channel_get_stream(self._ch._ch, i)
+            if ptr:
+                sid = brpc_stream_t.from_address(ptr).stream_id
+                if sid == self._stream_id:
+                    return Stream(sid)
+        return None
 
     def notify(self, method, params=None):
         """Send a notification (no response expected).
@@ -654,3 +759,296 @@ class RpcClient:
                                     params_json if params_json else None,
                                     b"null")
         self._ch.send_data(self._stream_id, buf.value, end_stream=False)
+
+    def cancel(self):
+        """Cancel an in-flight RPC by sending RST_STREAM."""
+        self._ch.send_rst(self._stream_id)
+
+
+# ── TLS Layer ────────────────────────────────────────────────────────────
+
+
+class TlsContext:
+    """TLS context for creating TLS connections.
+
+    Usage:
+        TlsContext.init_global()
+        ctx = TlsContext.client()  # no CA verification
+        tls = ctx.connect(fd, "hostname")
+        # ... use tls.read()/tls.write()
+        tls.close()
+        ctx.destroy()
+    """
+
+    _initialized = False
+
+    @classmethod
+    def init_global(cls):
+        if not cls._initialized:
+            lib.brpc_tls_init()
+            cls._initialized = True
+
+    @classmethod
+    def client(cls, ca_file=None, ca_dir=None):
+        cls.init_global()
+        ctx = TlsContext()
+        ctx._ctx = lib.brpc_tls_ctx_create_client(
+            ca_file.encode("utf-8") if ca_file else None,
+            ca_dir.encode("utf-8") if ca_dir else None,
+        )
+        if not ctx._ctx:
+            raise RuntimeError("Failed to create TLS client context")
+        return ctx
+
+    @classmethod
+    def server(cls, cert_file, key_file):
+        cls.init_global()
+        ctx = TlsContext()
+        ctx._ctx = lib.brpc_tls_ctx_create_server(
+            cert_file.encode("utf-8"),
+            key_file.encode("utf-8"),
+        )
+        if not ctx._ctx:
+            raise RuntimeError("Failed to create TLS server context")
+        return ctx
+
+    def connect(self, fd, hostname=None):
+        tls = TlsConnection()
+        tls._tls = lib.brpc_tls_connect(
+            self._ctx, fd,
+            hostname.encode("utf-8") if hostname else None,
+        )
+        if not tls._tls:
+            raise RuntimeError("TLS handshake failed")
+        return tls
+
+    def accept(self, fd):
+        tls = TlsConnection()
+        tls._tls = lib.brpc_tls_accept(self._ctx, fd)
+        if not tls._tls:
+            raise RuntimeError("TLS accept failed")
+        return tls
+
+    def destroy(self):
+        if self._ctx:
+            lib.brpc_tls_ctx_destroy(self._ctx)
+            self._ctx = None
+
+
+class TlsConnection:
+    """A TLS-wrapped connection."""
+
+    def __init__(self):
+        self._tls = None
+
+    @property
+    def fd(self):
+        return lib.brpc_tls_fd(self._tls)
+
+    def read(self, size=65536):
+        buf = ctypes.create_string_buffer(size)
+        n = lib.brpc_tls_read(self._tls, buf, size)
+        if n <= 0:
+            return b""
+        return buf.raw[:n]
+
+    def write(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        buf = ctypes.create_string_buffer(data)
+        return lib.brpc_tls_write(self._tls, buf, len(data))
+
+    def close(self):
+        if self._tls:
+            lib.brpc_tls_close(self._tls)
+
+    def destroy(self):
+        if self._tls:
+            lib.brpc_tls_free(self._tls)
+            self._tls = None
+
+__all__.extend(["AsyncChannel", "AsyncRpcClient", "TlsContext", "TlsConnection"])
+
+
+class AsyncChannel:
+    """Async wrapper around Channel using asyncio event loop.
+
+    Usage:
+        async with AsyncChannel(fd, is_server=False) as ch:
+            await ch.recv()
+            # process streams...
+    """
+
+    def __init__(self, fd, is_server=False, max_streams=0, loop=None):
+        self._ch = Channel(fd, is_server, max_streams)
+        self._loop = loop
+        self._fd = fd
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        self._ch.destroy()
+
+    @property
+    def channel(self):
+        return self._ch
+
+    @property
+    def stream_count(self):
+        return self._ch.stream_count
+
+    @property
+    def is_closed(self):
+        return self._ch.is_closed
+
+    def open_stream(self):
+        return self._ch.open_stream()
+
+    def send_data(self, stream_id, data, end_stream=False):
+        return self._ch.send_data(stream_id, data, end_stream)
+
+    def send_rst(self, stream_id, error_code=0):
+        return self._ch.send_rst(stream_id, error_code)
+
+    def send_ping(self):
+        return self._ch.send_ping()
+
+    def close(self):
+        return self._ch.close()
+
+    async def recv(self):
+        """Wait for data on the socket using the event loop, then pump."""
+        loop = self._loop or asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._wait_readable)
+        self._ch.pump()
+
+    def _wait_readable(self):
+        """Block until the socket is readable (runs in executor)."""
+        try:
+            p = select.poll()
+            p.register(self._fd, select.POLLIN)
+            p.poll(-1)  # Block indefinitely
+        except Exception:
+            pass
+
+    async def pump(self):
+        """Non-blocking pump — check once without blocking."""
+        loop = self._loop or asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._ch.pump)
+
+    def next_ready_stream(self, last_id=0):
+        return self._ch.next_ready_stream(last_id)
+
+    def get_stream(self, index):
+        return self._ch.get_stream(index)
+
+    def destroy(self):
+        self._ch.destroy()
+
+
+class AsyncRpcClient:
+    """Async JSON-RPC 2.0 client.
+
+    Usage:
+        async with AsyncChannel(fd) as ch:
+            stream = ch.open_stream()
+            cli = AsyncRpcClient(ch, stream.stream_id)
+            result = await cli.call("getUser", {"id": 1})
+    """
+
+    def __init__(self, async_channel, stream_id):
+        self._ach = async_channel
+        self._stream_id = stream_id
+        self._loop = async_channel._loop
+
+    async def call(self, method, params=None, timeout_ms=None):
+        """Call a remote method asynchronously.
+
+        Args:
+            method: Method name.
+            params: Params dict/list/value (will be serialized to JSON).
+            timeout_ms: Timeout in milliseconds (None = no timeout).
+
+        Returns:
+            Raw JSON response string, or None on timeout.
+        """
+        # Serialize params
+        params_json = None
+        if params is not None:
+            w = JsonWriter()
+            _write_value(w, params)
+            params_json = w.finish()
+
+        # Build request
+        id_val = f'"{id(self) % 10000}"'
+        buf = (ctypes.c_char * 4096)()
+        lib.brpc_rpc_build_request(buf, len(buf),
+                                    method.encode("utf-8"),
+                                    params_json if params_json else None,
+                                    id_val.encode("utf-8"))
+        req = buf.value
+
+        # Send request
+        self._ach.send_data(self._stream_id, req, end_stream=False)
+
+        # Wait for response
+        deadline = None
+        if timeout_ms is not None:
+            deadline = _monotonic_ms() + timeout_ms
+
+        while True:
+            if deadline is not None:
+                remaining = deadline - _monotonic_ms()
+                if remaining <= 0:
+                    return None
+
+            # Wait for socket readability
+            loop = self._loop or asyncio.get_event_loop()
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, self._wait_readable),
+                    timeout=remaining / 1000.0 if deadline else None
+                )
+            except asyncio.TimeoutError:
+                return None
+
+            self._ach.channel.pump()
+
+            # Check if our stream has data
+            count = self._ach.channel.stream_count
+            for i in range(count):
+                ptr = lib.brpc_channel_get_stream(self._ach.channel._ch, i)
+                if ptr:
+                    sid = brpc_stream_t.from_address(ptr).stream_id
+                    if sid == self._stream_id:
+                        s = Stream(sid)
+                        if s.available_read > 0:
+                            return s.read(s.available_read).decode("utf-8")
+
+    def _wait_readable(self):
+        try:
+            p = select.poll()
+            p.register(self._ach._fd, select.POLLIN)
+            p.poll(-1)
+        except Exception:
+            pass
+
+    async def notify(self, method, params=None):
+        """Send a notification (no response expected)."""
+        params_json = None
+        if params is not None:
+            w = JsonWriter()
+            _write_value(w, params)
+            params_json = w.finish()
+
+        buf = (ctypes.c_char * 4096)()
+        lib.brpc_rpc_build_request(buf, len(buf),
+                                    method.encode("utf-8"),
+                                    params_json if params_json else None,
+                                    b"null")
+        self._ach.send_data(self._stream_id, buf.value, end_stream=False)
+
+    async def cancel(self):
+        """Cancel an in-flight RPC by sending RST_STREAM."""
+        self._ach.send_rst(self._stream_id)

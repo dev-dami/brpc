@@ -2,29 +2,28 @@
 
 A small RPC framework for trusted networks. It provides multiplexed streams, JSON-RPC 2.0, and C/Python bindings with minimal dependencies, prioritizing simplicity and low latency over security features and ecosystem breadth.
 
-> **Security warning**: brpc has no TLS, no authentication, and no encryption.
-> Do not expose brpc services over the public internet.
-> Use only in trusted networks or behind a TLS-terminating proxy.
+> **Note**: brpc has no authentication or authorization.
+> Use TLS in production or run behind a TLS-terminating proxy.
 
 ## Design philosophy
 
 brpc optimizes for:
 
 - Small codebase with minimal dependencies
-- Low latency on controlled networks
+- Low latency
 - Human-readable JSON payloads
 - Explicit tradeoffs documented in code and docs
 
 brpc does NOT optimize for:
 
-- Internet-facing deployments
+- Internet-facing deployments (no auth)
 - Enterprise security features
 - Cross-language interoperability
 - HTTP/2 compatibility
 
 ## Why JSON?
 
-JSON is slower than Protobuf, but:
+JSON is generally slower and larger than Protobuf, but:
 
 - Human-readable JSON payloads — easy to inspect in logs or packet captures
 - No schema compiler needed
@@ -53,10 +52,9 @@ Data flow: `RPC handler → JSON serialize → Stream → Frame → TCP`
 
 ## When NOT to use this
 
-- You need TLS (not implemented)
 - You need cross-language interop (C + Python only)
 - You need authentication/authorization
-- You need async/event-loop integration
+- You need async/event-loop integration (Python only via AsyncChannel)
 - You need backward-compatible protocol versioning
 - You're exposing services to the public internet
 
@@ -141,7 +139,7 @@ int main(void) {
 }
 ```
 
-### Python (complete with threading)
+### Python (minimal example)
 
 ```python
 from brpc import RpcServer, RpcClient, Channel
@@ -262,8 +260,8 @@ Three separate mechanisms:
 
 **Atomicity:**
 - Each `brpc_channel_send_data()` call produces one DATA frame
-- The receiver gets the full payload in one `on_data` callback
-- Partial reads are not possible at the frame level
+- The stream layer presents complete frames — applications never observe partial frame payloads
+- `brpc_stream_read()` returns all available bytes up to the requested size
 
 **Stream fairness:**
 - Streams are serviced in order of arrival (FIFO per connection)
@@ -280,6 +278,11 @@ Three separate mechanisms:
 - Closed streams never reopen
 - New streams get monotonically increasing IDs
 
+**Connection shutdown (GOAWAY):**
+- GOAWAY prevents creation of new streams
+- Existing streams may continue until completion, reset, or transport close
+- After GOAWAY: `brpc_channel_open_stream()` fails, pending streams continue, closed channels cannot be reopened
+
 ## Blocking semantics
 
 | Function | Blocks? | Notes |
@@ -288,7 +291,8 @@ Three separate mechanisms:
 | `brpc_channel_pump()` | No | Returns immediately (EAGAIN if no data) |
 | `brpc_channel_send_data()` | Depends | Blocks if fd is blocking and kernel buffer full |
 | `brpc_stream_read()` | No | Returns available bytes from ring buffer |
-| `brpc_rpc_call()` | Yes | Sends request, waits for response |
+| `brpc_rpc_call()` | Yes | Sends request, waits for response (no timeout) |
+| `brpc_rpc_call_timeout()` | Yes | Like call(), but returns `BRPC_RPC_ERROR_TIMEOUT` after `timeout_ms` |
 | `brpc_rpc_notify()` | No | Fire-and-forget, no response expected |
 
 ## Error handling
@@ -376,7 +380,7 @@ Measured on AMD Ryzen 7 5800X, Linux 6.x, `zig cc 0.16 -O2`, single thread, `soc
 
 **Memory**: Peak RSS 2MB for all components.
 
-**Methodology**: These are microbenchmarks on a single thread. CPU governor set to `performance`. Median of 10 million iterations per operation. Numbers represent ideal-case throughput and should not be interpreted as production latency under concurrent load.
+**Methodology**: These are microbenchmarks on a single thread. CPU governor set to `performance`. Median of 10 million iterations per operation. Numbers represent ideal-case throughput and should not be interpreted as production latency under concurrent load. Benchmark code is included in `bench.c`.
 
 ## Comparison
 
@@ -385,7 +389,7 @@ Measured on AMD Ryzen 7 5800X, Linux 6.x, `zig cc 0.16 -O2`, single thread, `soc
 | RTT | 2.4µs | Varies by transport/language | ~1µs |
 | Multiplexing | Yes | Yes | No |
 | Flow control | Yes | Yes | No |
-| TLS | No | Yes | No |
+| TLS | Yes (OpenSSL) | Yes | No |
 | Codegen | No | Yes (Protobuf) | No |
 | Streaming | Yes | Yes | Manual |
 | Language support | C, Python | 10+ | Any |
@@ -437,17 +441,18 @@ The wire format is experimental until v1.0. A protocol version field will be add
 ```text
 v0.2
   - Stable public API
-  - epoll/kqueue integration
-  - Improved backpressure signals
+  - epoll/kqueue integration (fd, wants_read, wants_write)
+  - Improved backpressure signals (send_window, is_writable)
+  - RPC timeouts (brpc_rpc_call_timeout)
+  - Stream cancellation (RST_STREAM, brpc_rpc_cancel)
+  - Connection lifecycle callbacks (on_disconnect, on_close)
+  - SETTINGS handshake with protocol version
 
 v0.3
-  - TLS support
-  - Compression (zlib/zstd)
+  - Stable wire format
+  - Backward compatibility guarantees
 
 v1.0
-  - Stable wire format with version field
-  - Protocol versioning
-  - Backward compatibility guarantees
 
 Post v1.0
   - Rust bindings
@@ -460,8 +465,11 @@ Post v1.0
 **Q: Why not just use gRPC?**
 A: If you need TLS, cross-language support, or a mature ecosystem, use gRPC. brpc is for when those aren't needed and you want simplicity + speed.
 
+**Q: Is brpc HTTP/2 compatible?**
+A: No. brpc borrows ideas such as multiplexed streams and flow control, but uses its own framing protocol and wire format. HTTP/2 clients and servers cannot communicate with brpc.
+
 **Q: Can I use this in production?**
-A: Only in trusted networks behind TLS termination. The wire format is experimental until v1.0.
+A: Yes, in trusted networks or behind TLS termination. brpc now supports TLS via OpenSSL. The wire format is experimental until v1.0.
 
 **Q: Does send_data drop data?**
 A: No. If the stream buffer is full, `brpc_stream_write()` returns 0 bytes written. The caller retries. Data is never silently dropped.
@@ -470,7 +478,7 @@ A: No. If the stream buffer is full, `brpc_stream_write()` returns 0 bytes writt
 A: The parser uses zero-copy arena allocation. JsonValue wraps C pointers. RpcServer handlers return plain Python types.
 
 **Q: Can RPC calls be cancelled?**
-A: Not currently. `brpc_rpc_call()` blocks until: response received, transport error, or connection closed. Cancellation APIs are planned post-v1.0.
+A: Yes. Use `brpc_rpc_call_timeout()` for timeout-based cancellation, or `brpc_rpc_cancel()` to send a RST_STREAM frame that aborts the stream immediately.
 
 **Q: What happens on disconnect?**
 A: No automatic reconnect. If a channel closes: all streams fail, pending RPC calls return errors, application creates a new channel. Automatic retries are the application's responsibility.
@@ -488,11 +496,15 @@ A: No automatic reconnect. If a channel closes: all streams fail, pending RPC ca
 | Error propagation | Done |
 | Profiling | Done |
 | Python bindings | Done |
-| TLS | Not implemented |
+| TLS | Done (OpenSSL, client + server) |
 | Authentication | Not implemented |
-| Compression | Not implemented |
-| Async/event-loop integration | Not implemented |
-| Application-level backpressure | Not implemented |
+| Compression | Done (zlib, per-frame COMPRESSED flag) |
+| Async/event-loop integration | Python (AsyncChannel, AsyncRpcClient) + C (fd, wants_read, wants_write) |
+| Application-level backpressure | Partial (send_window, is_writable, available_write) |
+| Stream cancellation (RST_STREAM) | Done |
+| RPC timeout | Done |
+| Connection lifecycle callbacks | Done (on_new_stream, on_disconnect, on_close) |
+| Protocol versioning | Done (SETTINGS frame, BRPC_PROTOCOL_VERSION) |
 | Protocol versioning | Planned for v1.0 |
 | Cross-language interop | C + Python only |
 
