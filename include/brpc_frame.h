@@ -79,6 +79,12 @@ extern "C" {
 #define BRPC_SETTINGS_MAX_FRAME_SIZE   0x02
 #define BRPC_SETTINGS_WINDOW_SIZE      0x03
 #define BRPC_SETTINGS_PROTOCOL_VERSION 0x04
+#define BRPC_SETTINGS_COMPRESSION      0x05
+
+/* Compression algorithms (bitmask for SETTINGS_COMPRESSION). */
+#define BRPC_COMPRESS_NONE             0x00
+#define BRPC_COMPRESS_ZLIB             0x01
+#define BRPC_COMPRESS_ZSTD             0x02
 
 /* --------------------------------------------------------------------------
  * Frame flags (bitfield)

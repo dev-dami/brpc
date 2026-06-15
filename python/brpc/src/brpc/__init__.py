@@ -124,7 +124,7 @@ lib.brpc_stream_send_window.restype = ctypes.c_int32
 lib.brpc_stream_is_writable.argtypes = [ctypes.POINTER(brpc_stream_t)]
 lib.brpc_stream_is_writable.restype = ctypes.c_int
 
-CHANNEL_SIZE = 104  # sizeof(brpc_channel_t) with dynamic stream table
+CHANNEL_SIZE = 160  # sizeof(brpc_channel_t) with dynamic stream table
 STREAM_COUNT_OFFSET = 20  # offsetof(brpc_channel_t, stream_count)
 lib.brpc_channel_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
 lib.brpc_channel_init.restype = ctypes.c_int
@@ -173,6 +173,32 @@ lib.brpc_tls_fd.argtypes = [ctypes.c_void_p]
 lib.brpc_tls_fd.restype = ctypes.c_int
 lib.brpc_tls_error_string.argtypes = []
 lib.brpc_tls_error_string.restype = ctypes.c_char_p
+
+# ── Error enum ───────────────────────────────────────────────────────────
+
+class brpc_stats_t(ctypes.Structure):
+    _fields_ = [
+        ("bytes_sent", ctypes.c_uint64),
+        ("bytes_recv", ctypes.c_uint64),
+        ("frames_sent", ctypes.c_uint64),
+        ("frames_recv", ctypes.c_uint64),
+        ("streams_opened", ctypes.c_uint64),
+        ("streams_closed", ctypes.c_uint64),
+        ("rpc_calls", ctypes.c_uint64),
+        ("rpc_errors", ctypes.c_uint64),
+    ]
+
+lib.brpc_error_string.argtypes = [ctypes.c_int]
+lib.brpc_error_string.restype = ctypes.c_char_p
+
+lib.brpc_channel_reset_ready_iter.argtypes = [ctypes.c_void_p]
+lib.brpc_channel_reset_ready_iter.restype = None
+
+lib.brpc_channel_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(brpc_stats_t)]
+lib.brpc_channel_stats.restype = None
+
+lib.brpc_rpc_server_poll.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+lib.brpc_rpc_server_poll.restype = ctypes.c_int
 
 lib.brpc_channel_fd.argtypes = [ctypes.c_void_p]
 lib.brpc_channel_fd.restype = ctypes.c_int
@@ -403,6 +429,23 @@ class Channel:
         sid = brpc_stream_t.from_address(s).stream_id
         return Stream(sid)
 
+    def reset_ready_iter(self):
+        """Reset the ready-stream iterator for a fresh loop."""
+        lib.brpc_channel_reset_ready_iter(self._ch)
+
+    def stats(self) -> dict:
+        """Get channel statistics."""
+        s = brpc_stats_t()
+        lib.brpc_channel_stats(self._ch, ctypes.byref(s))
+        return {
+            "bytes_sent": s.bytes_sent,
+            "bytes_recv": s.bytes_recv,
+            "frames_sent": s.frames_sent,
+            "frames_recv": s.frames_recv,
+            "streams_opened": s.streams_opened,
+            "streams_closed": s.streams_closed,
+        }
+
     def open_stream(self) -> Stream:
         s = lib.brpc_channel_open_stream(self._ch)
         if not s:
@@ -599,6 +642,20 @@ class RpcServer:
 
         # Build response
         return self._build_result(self._id_str(id_val), result)
+
+    def poll(self, channel):
+        """Recv + dispatch all ready requests in one call.
+
+        Args:
+            channel: A Channel object (the server-side channel).
+        """
+        channel.recv()
+        s = None
+        while (s := channel.next_ready_stream(s.stream_id if s else 0)):
+            data = s.read()
+            resp = self.dispatch(data)
+            if resp:
+                channel.send_data(s.stream_id, resp.encode())
 
     def _id_str(self, id_val):
         if id_val is None:
@@ -951,9 +1008,14 @@ class AsyncRpcClient:
     """Async JSON-RPC 2.0 client.
 
     Usage:
+        # Low-level:
         async with AsyncChannel(fd) as ch:
             stream = ch.open_stream()
             cli = AsyncRpcClient(ch, stream.stream_id)
+            result = await cli.call("getUser", {"id": 1})
+
+        # High-level (connect to a TCP server):
+        async with AsyncRpcClient.connect("127.0.0.1", 8000) as cli:
             result = await cli.call("getUser", {"id": 1})
     """
 
@@ -961,6 +1023,37 @@ class AsyncRpcClient:
         self._ach = async_channel
         self._stream_id = stream_id
         self._loop = async_channel._loop
+        self._owns_channel = False
+
+    @classmethod
+    async def connect(cls, host, port, loop=None):
+        """High-level async connect to a TCP server.
+
+        Returns an async context manager that yields an AsyncRpcClient.
+
+        Usage:
+            async with AsyncRpcClient.connect("127.0.0.1", 8000) as cli:
+                result = await cli.call("add", [1, 2])
+        """
+        import socket as _socket
+        sock = _socket.create_connection((host, port))
+        sock.setblocking(False)
+        ach = AsyncChannel(sock.fileno(), is_server=False, loop=loop)
+        ach._owns_socket = sock
+        stream = ach.open_stream()
+        cli = cls(ach, stream.stream_id)
+        cli._owns_channel = True
+        return cli
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        if self._owns_channel:
+            self._ach.channel.close()
+            self._ach.destroy()
+            if hasattr(self._ach, '_owns_socket'):
+                self._ach._owns_socket.close()
 
     async def call(self, method, params=None, timeout_ms=None):
         """Call a remote method asynchronously.

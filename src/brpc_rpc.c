@@ -214,6 +214,34 @@ int brpc_rpc_server_dispatch(brpc_rpc_server_t *srv,
     return 0;
 }
 
+int brpc_rpc_server_poll(brpc_rpc_server_t *srv, brpc_channel_t *ch)
+{
+    if (!srv || !ch) return -1;
+
+    /* Receive pending data. */
+    int rc = brpc_channel_recv(ch);
+    if (rc != 0) return rc;
+
+    /* Dispatch all ready streams. */
+    brpc_stream_t *s = NULL;
+    brpc_channel_reset_ready_iter(ch);
+    while ((s = brpc_channel_next_ready_stream(ch,
+                s ? s->stream_id : 0)) != NULL) {
+        char buf[4096];
+        size_t avail = brpc_stream_available_read(s);
+        if (avail == 0) continue;
+        if (avail > sizeof(buf) - 1) avail = sizeof(buf) - 1;
+
+        int n = brpc_stream_read(s, (uint8_t *)buf, avail);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+
+        brpc_rpc_server_dispatch(srv, ch, s->stream_id, buf, (size_t)n);
+    }
+
+    return 0;
+}
+
 /* --------------------------------------------------------------------------
  * Client
  * -------------------------------------------------------------------------- */

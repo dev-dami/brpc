@@ -38,3 +38,7 @@ profile.csv
 
 # Debug binaries
 test_brpc_debug
+
+# LSP / clangd
+compile_commands.json
+.clangd

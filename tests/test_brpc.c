@@ -6,6 +6,7 @@
 #include "brpc_prof.h"
 #include "brpc_compress.h"
 #include "brpc_tls.h"
+#include "brpc_error.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1298,6 +1299,102 @@ static void test_tls(void)
 }
 
 /* ========================================================================
+ * API Polish Tests
+ * ======================================================================== */
+
+static void test_api_polish(void)
+{
+    TEST("brpc_error_string covers all codes");
+    if (strcmp(brpc_error_string(BRPC_OK), "ok") == 0 &&
+        strcmp(brpc_error_string(BRPC_ERROR_CLOSED), "channel closed") == 0 &&
+        strcmp(brpc_error_string(BRPC_ERROR_TIMEOUT), "timeout") == 0 &&
+        strcmp(brpc_error_string(BRPC_ERROR_IO), "I/O error") == 0 &&
+        strcmp(brpc_error_string((brpc_error_t)999), "unknown error") == 0) {
+        PASS();
+    } else { FAIL("error_string mismatch"); }
+
+    TEST("channel reset_ready_iter");
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    brpc_channel_t ch;
+    brpc_channel_init(&ch, sv[0], 0, 0);
+    brpc_stream_t *s = brpc_channel_open_stream(&ch);
+    /* Send data so stream has something to read. */
+    brpc_channel_send_data(&ch, s->stream_id,
+                           (const uint8_t *)"hi", 2, 0);
+    /* Read it on the other end. */
+    brpc_channel_t srv_ch;
+    brpc_channel_init(&srv_ch, sv[1], 1, 0);
+    brpc_channel_recv(&srv_ch);
+
+    /* Iterate ready streams. */
+    brpc_stream_t *rs = NULL;
+    int count = 0;
+    while ((rs = brpc_channel_next_ready_stream(&srv_ch,
+                rs ? rs->stream_id : 0)) != NULL) {
+        count++;
+    }
+    if (count > 0) {
+        PASS();
+    } else { FAIL("no ready streams"); }
+
+    TEST("channel stats");
+    brpc_stats_t stats;
+    brpc_channel_stats(&ch, &stats);
+    if (stats.frames_sent > 0 && stats.streams_opened > 0) {
+        PASS();
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "frames_sent=%lu streams_opened=%lu",
+                 (unsigned long)stats.frames_sent,
+                 (unsigned long)stats.streams_opened);
+        FAIL(msg);
+    }
+
+    TEST("rpc_server_poll does not crash");
+    brpc_rpc_server_t srv;
+    brpc_rpc_server_init(&srv);
+    /* Send a request so poll has something to recv and dispatch. */
+    brpc_rpc_register(&srv, "echo", handler_echo, NULL);
+    brpc_channel_send_data(&ch, s->stream_id,
+                           (const uint8_t *)"{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"id\":1}",
+                           44, 0);
+    int rc = brpc_rpc_server_poll(&srv, &srv_ch);
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("poll returned error"); }
+
+    TEST("channel_init_ex with config");
+    brpc_channel_t ch2;
+    brpc_channel_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.is_server = 0;
+    cfg.max_streams = 16;
+    cfg.compress = 1;
+    int sv2[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv2);
+    rc = brpc_channel_init_ex(&ch2, sv2[0], &cfg);
+    if (rc == BRPC_OK && ch2.compress == 1 && ch2.max_streams == 16) {
+        PASS();
+    } else { FAIL("init_ex failed"); }
+
+    TEST("channel_init_ex NULL config returns error");
+    brpc_channel_t ch3;
+    rc = brpc_channel_init_ex(&ch3, sv2[0], NULL);
+    if (rc == BRPC_ERROR_INVALID_ARGUMENT) {
+        PASS();
+    } else { FAIL("should return INVALID_ARGUMENT"); }
+
+    brpc_channel_destroy(&ch);
+    brpc_channel_destroy(&srv_ch);
+    brpc_channel_destroy(&ch2);
+    close(sv[0]);
+    close(sv[1]);
+    close(sv2[0]);
+    close(sv2[1]);
+}
+
+/* ========================================================================
  * Main
  * ======================================================================== */
 
@@ -1330,6 +1427,9 @@ int main(void) {
 
     printf("\n=== Compression Tests ===\n");
     test_compression();
+
+    printf("\n=== API Polish Tests ===\n");
+    test_api_polish();
 
     printf("\n=== TLS Tests ===\n");
     test_tls();

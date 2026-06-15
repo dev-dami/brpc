@@ -16,7 +16,6 @@
  */
 
 #include "brpc_channel.h"
-#include "brpc_frame.h"
 #include "brpc_stream.h"
 #include "brpc_prof.h"
 
@@ -79,7 +78,7 @@ int brpc_channel_send_settings(brpc_channel_t *ch)
      * SETTINGS payload: sequence of key-value pairs.
      * Each pair: LE16 key + LE32 value = 6 bytes.
      */
-    uint8_t payload[24];  /* 4 pairs × 6 bytes */
+    uint8_t payload[30];  /* 5 pairs × 6 bytes */
     int off = 0;
 
     /* MAX_STREAMS */
@@ -95,6 +94,12 @@ int brpc_channel_send_settings(brpc_channel_t *ch)
     /* PROTOCOL_VERSION */
     write_le16_settings(payload + off, BRPC_SETTINGS_PROTOCOL_VERSION);
     write_le32_settings(payload + off + 2, BRPC_PROTOCOL_VERSION);
+    off += 6;
+
+    /* COMPRESSION */
+    write_le16_settings(payload + off, BRPC_SETTINGS_COMPRESSION);
+    write_le32_settings(payload + off + 2,
+                        ch->compress ? BRPC_COMPRESS_ZLIB : BRPC_COMPRESS_NONE);
     off += 6;
 
     brpc_frame_t frame;
@@ -132,6 +137,13 @@ static int parse_settings(brpc_channel_t *ch, const uint8_t *payload,
             break;
         case BRPC_SETTINGS_PROTOCOL_VERSION:
             ch->protocol_version = val;
+            break;
+        case BRPC_SETTINGS_COMPRESSION:
+            /* Peer advertises supported compression algorithms.
+             * Enable zlib if the peer supports it and we have it. */
+            if (val & BRPC_COMPRESS_ZLIB) {
+                ch->compress = 1;
+            }
             break;
         default:
             break;  /* Ignore unknown keys. */
@@ -216,6 +228,7 @@ static brpc_stream_t *find_or_create_stream(brpc_channel_t *ch,
         return NULL;
     }
     ch->stream_count++;
+    ch->stat_streams_opened++;
 
     if (stream_id >= ch->next_stream_id) {
         ch->next_stream_id = stream_id + 2;
@@ -296,6 +309,7 @@ static int dispatch_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
                 s->state = BRPC_STREAM_HALF_CLOSED_REMOTE;
             } else if (s->state == BRPC_STREAM_HALF_CLOSED_LOCAL) {
                 s->state = BRPC_STREAM_CLOSED;
+                ch->stat_streams_closed++;
                 if (s->on_close) {
                     s->on_close(s, s->user_ctx);
                 }
@@ -330,6 +344,7 @@ static int dispatch_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
                 s->state = BRPC_STREAM_HALF_CLOSED_REMOTE;
             } else if (s->state == BRPC_STREAM_HALF_CLOSED_LOCAL) {
                 s->state = BRPC_STREAM_CLOSED;
+                ch->stat_streams_closed++;
                 if (s->on_close) {
                     s->on_close(s, s->user_ctx);
                 }
@@ -356,6 +371,7 @@ static int dispatch_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
         }
 
         s->state = BRPC_STREAM_CLOSED;
+        ch->stat_streams_closed++;
         if (s->on_error) {
             s->on_error(s, error_code, s->user_ctx);
         }
@@ -473,6 +489,7 @@ static int parse_frames(brpc_channel_t *ch)
             return -1;
         }
 
+        ch->stat_frames_recv++;
         offset += (size_t)consumed;
     }
 
@@ -565,6 +582,7 @@ brpc_stream_t *brpc_channel_open_stream(brpc_channel_t *ch)
 
     ch->stream_count++;
     ch->next_stream_id += 2;  /* Maintain odd/even parity. */
+    ch->stat_streams_opened++;
 
     return s;
 }
@@ -650,6 +668,12 @@ int brpc_channel_send_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
 
     int rc = write_all(ch->fd, buf, (size_t)encoded);
     if (heap) free(buf);
+
+    if (rc == 0) {
+        ch->stat_bytes_sent += frame->payload_length;
+        ch->stat_frames_sent++;
+    }
+
     return rc;
 }
 
@@ -686,6 +710,7 @@ int brpc_channel_recv(brpc_channel_t *ch)
     }
 
     ch->conn_buf_len += (size_t)n;
+    ch->stat_bytes_recv += (size_t)n;
 
     int rc = parse_frames(ch);
     BRPC_PROF_RECORD("channel_recv", BRPC_PROF_NOW() - _t0, (size_t)n);
@@ -720,6 +745,7 @@ int brpc_channel_pump(brpc_channel_t *ch)
     }
 
     ch->conn_buf_len += (size_t)n;
+    ch->stat_bytes_recv += (size_t)n;
 
     int rc = parse_frames(ch);
     BRPC_PROF_RECORD("channel_pump", BRPC_PROF_NOW() - _t0, (size_t)n);
@@ -889,6 +915,7 @@ int brpc_channel_send_rst(brpc_channel_t *ch, uint32_t stream_id,
     brpc_stream_t *s = brpc_channel_find_stream(ch, stream_id);
     if (s) {
         s->state = BRPC_STREAM_CLOSED;
+        ch->stat_streams_closed++;
         if (s->on_close) {
             s->on_close(s, s->user_ctx);
         }
@@ -936,4 +963,50 @@ int brpc_channel_wants_write(const brpc_channel_t *ch)
      * stream has pending outgoing data.
      */
     return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Stream iterator
+ * -------------------------------------------------------------------------- */
+
+void brpc_channel_reset_ready_iter(brpc_channel_t *ch)
+{
+    if (ch) ch->ready_cursor = 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Extended init
+ * -------------------------------------------------------------------------- */
+
+int brpc_channel_init_ex(brpc_channel_t *ch, int fd,
+                         const brpc_channel_config_t *cfg)
+{
+    if (!ch || !cfg) return BRPC_ERROR_INVALID_ARGUMENT;
+
+    int rc = brpc_channel_init(ch, fd, cfg->is_server, cfg->max_streams);
+    if (rc != 0) return BRPC_ERROR_ALLOCATION;
+
+    if (cfg->compress) {
+        ch->compress = 1;
+    }
+
+    return BRPC_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * Observability
+ * -------------------------------------------------------------------------- */
+
+void brpc_channel_stats(const brpc_channel_t *ch, brpc_stats_t *stats)
+{
+    if (!ch || !stats) return;
+
+    stats->bytes_sent      = ch->stat_bytes_sent;
+    stats->bytes_recv      = ch->stat_bytes_recv;
+    stats->frames_sent     = ch->stat_frames_sent;
+    stats->frames_recv     = ch->stat_frames_recv;
+    stats->streams_opened  = ch->stat_streams_opened;
+    stats->streams_closed  = ch->stat_streams_closed;
+    stats->rpc_calls       = 0;  /* Filled by RPC layer if needed. */
+    stats->rpc_errors      = 0;
 }

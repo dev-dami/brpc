@@ -2,7 +2,7 @@ CC ?= zig cc
 CFLAGS = -Wall -Wextra -O2 -Iinclude
 LDFLAGS = -lm -lz -lssl -lcrypto
 
-SRC = src/json_hotpath.c src/brpc_frame.c src/brpc_stream.c src/brpc_channel.c src/brpc_prof.c src/brpc_rpc.c src/brpc_compress.c src/brpc_tls.c
+SRC = src/json_hotpath.c src/brpc_frame.c src/brpc_stream.c src/brpc_channel.c src/brpc_prof.c src/brpc_rpc.c src/brpc_compress.c src/brpc_tls.c src/brpc_error.c
 
 BUILDDIR = build
 PYTHON_PKG = python/brpc

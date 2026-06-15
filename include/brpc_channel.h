@@ -20,6 +20,7 @@
 
 #include "brpc_frame.h"
 #include "brpc_stream.h"
+#include "brpc_error.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -89,6 +90,20 @@ typedef struct brpc_channel {
     void *user_ctx;                      /**< Forwarded to callbacks.          */
 
     int  closed;                         /**< Non-zero after GOAWAY sent/recv. */
+
+    /* ---- ready-stream iterator ---- */
+    int  ready_cursor;                   /**< Index for next_ready_stream.    */
+
+    /* ---- observability counters ---- */
+    uint64_t stat_bytes_sent;
+    uint64_t stat_bytes_recv;
+    uint64_t stat_frames_sent;
+    uint64_t stat_frames_recv;
+    uint64_t stat_streams_opened;
+    uint64_t stat_streams_closed;
+
+    /* ---- TLS (optional, set via init_ex) ---- */
+    void *tls;                           /**< Opaque brpc_tls_t pointer.      */
 } brpc_channel_t;
 
 /* --------------------------------------------------------------------------
@@ -104,6 +119,31 @@ typedef struct brpc_channel {
  */
 int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server,
                       uint32_t max_streams);
+
+/**
+ * Channel configuration for brpc_channel_init_ex().
+ * Zero-initialise with memset(&cfg, 0, sizeof(cfg)) for defaults.
+ */
+typedef struct brpc_channel_config {
+    int      is_server;        /**< Non-zero for server mode.             */
+    uint32_t max_streams;      /**< 0 = BRPC_MAX_STREAMS.                 */
+    int      compress;         /**< Non-zero to enable compression.       */
+
+    /* TLS (optional — only used if tls_enabled is set). */
+    int      tls_enabled;      /**< Non-zero to wrap fd with TLS.         */
+    const char *tls_cert_file; /**< Server certificate PEM path.          */
+    const char *tls_key_file;  /**< Server private key PEM path.          */
+    const char *tls_ca_file;   /**< CA file for client verification.      */
+    const char *tls_hostname;  /**< SNI hostname for client connect.      */
+} brpc_channel_config_t;
+
+/**
+ * Extended channel initialiser with full configuration.
+ *
+ * @return 0 on success, negative brpc_error_t on failure.
+ */
+int brpc_channel_init_ex(brpc_channel_t *ch, int fd,
+                         const brpc_channel_config_t *cfg);
 
 /**
  * Tear down the channel.  Destroys all streams and frees the connection
@@ -132,6 +172,13 @@ brpc_stream_t *brpc_channel_get_stream(const brpc_channel_t *ch, int index);
  */
 brpc_stream_t *brpc_channel_next_ready_stream(const brpc_channel_t *ch,
                                                uint32_t last_id);
+
+/**
+ * Reset the ready-stream iterator so the next call to
+ * brpc_channel_next_ready_stream() starts from the beginning.
+ * Call this after each recv/pump to start a fresh iteration.
+ */
+void brpc_channel_reset_ready_iter(brpc_channel_t *ch);
 
 /**
  * Check if the channel is closed (GOAWAY received/sent).
@@ -238,6 +285,29 @@ int brpc_channel_send_rst(brpc_channel_t *ch, uint32_t stream_id,
  * @return 0 on success, -1 on error.
  */
 int brpc_channel_close(brpc_channel_t *ch);
+
+/* --------------------------------------------------------------------------
+ * Observability
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Channel-level statistics.  Counters are cumulative since channel init.
+ */
+typedef struct brpc_stats {
+    uint64_t bytes_sent;         /**< Total payload bytes written to fd.    */
+    uint64_t bytes_recv;         /**< Total payload bytes read from fd.     */
+    uint64_t frames_sent;        /**< Total frames written.                 */
+    uint64_t frames_recv;        /**< Total frames parsed and dispatched.   */
+    uint64_t streams_opened;     /**< Streams created (local + remote).     */
+    uint64_t streams_closed;     /**< Streams that reached CLOSED state.    */
+    uint64_t rpc_calls;          /**< RPC requests sent.                    */
+    uint64_t rpc_errors;         /**< RPC error responses sent/received.    */
+} brpc_stats_t;
+
+/**
+ * Fill `stats` with cumulative counters for this channel.
+ */
+void brpc_channel_stats(const brpc_channel_t *ch, brpc_stats_t *stats);
 
 /* --------------------------------------------------------------------------
  * Event-loop integration

@@ -138,6 +138,16 @@ int brpc_rpc_server_dispatch(brpc_rpc_server_t *srv,
                              brpc_channel_t *ch, uint32_t stream_id,
                              const char *data, size_t data_len);
 
+/**
+ * Poll for incoming data and dispatch all ready requests.
+ *
+ * Combines recv + next_ready_stream + read + dispatch into one call.
+ * Useful for the common server event loop.
+ *
+ * @return 0 on success, negative on transport error.
+ */
+int brpc_rpc_server_poll(brpc_rpc_server_t *srv, brpc_channel_t *ch);
+
 /* --------------------------------------------------------------------------
  * Client — call remote methods
  * -------------------------------------------------------------------------- */
