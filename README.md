@@ -6,6 +6,34 @@ A lightweight RPC framework in C with Python bindings, designed for low-latency 
 > Do not expose brpc services over the public internet.
 > Use only in trusted networks or behind a TLS-terminating proxy.
 
+## Design philosophy
+
+brpc optimizes for:
+
+- Small codebase with minimal dependencies
+- Low latency on controlled networks
+- Human-readable JSON payloads
+- Explicit tradeoffs documented in code and docs
+
+brpc does NOT optimize for:
+
+- Internet-facing deployments
+- Enterprise security features
+- Cross-language interoperability
+- HTTP/2 compatibility
+
+## Why JSON?
+
+JSON is slower than Protobuf, but:
+
+- Human-readable — debug with tcpdump or printf
+- No schema compiler needed
+- Dynamic payloads without codegen
+- Familiar to Python and JavaScript developers
+- Easy to inspect in logs and traces
+
+brpc prioritizes simplicity and flexibility over maximum serialization efficiency.
+
 ## Mental model
 
 - **Channel**: One TCP connection that multiplexes many streams
@@ -34,7 +62,7 @@ Data flow: `RPC handler → JSON serialize → Stream → Frame → TCP`
 
 ## Complete working example
 
-### C (client + server)
+### C (client + server with fork)
 
 **server.c:**
 
@@ -50,16 +78,7 @@ int handle_add(const brpc_rpc_request_t *req,
     (void)ctx;
     int64_t a = json_get_int(json_array_get(req->params, 0), 0);
     int64_t b = json_get_int(json_array_get(req->params, 1), 0);
-
-    // Build result JSON
-    char result[64];
-    snprintf(result, sizeof(result), "%lld", (long long)(a + b));
-
-    // The response result must be a valid JSON value string.
-    // For simple types, serialize directly.
-    resp->error_code = 0;
-    // In this API, the dispatch function serializes resp->result
-    // if it's set. For integers, use the result string.
+    printf("Server: %lld + %lld = %lld\n", a, b, a + b);
     return BRPC_RPC_OK;
 }
 
@@ -67,86 +86,68 @@ int main(void) {
     int sv[2];
     socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
 
-    brpc_channel_t server;
-    brpc_channel_init(&server, sv[0], 1, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child = server */
+        close(sv[1]);
+        brpc_channel_t server;
+        brpc_channel_init(&server, sv[0], 1, 0);
 
-    brpc_rpc_server_t srv;
-    brpc_rpc_server_init(&srv);
-    brpc_rpc_register(&srv, "add", handle_add, NULL);
+        brpc_rpc_server_t srv;
+        brpc_rpc_server_init(&srv);
+        brpc_rpc_register(&srv, "add", handle_add, NULL);
 
-    printf("Server ready. Waiting for request...\n");
+        /* Blocking recv — waits for client request */
+        brpc_channel_recv(&server);
 
-    // Blocking read
-    brpc_channel_recv(&server);
-
-    // Find the stream that received data
-    for (int i = 0; i < server.stream_count; i++) {
-        brpc_stream_t *s = &server.streams[i];
-        size_t avail = brpc_stream_available_read(s);
-        if (avail > 0) {
+        /* Dispatch from the first active stream */
+        if (server.stream_count > 0) {
+            brpc_stream_t *s = &server.streams[0];
             char buf[1024];
             int n = brpc_stream_read(s, (uint8_t *)buf, sizeof(buf) - 1);
             buf[n] = '\0';
-            printf("Received: %s\n", buf);
-
-            // Dispatch (calls handler, sends response)
             brpc_rpc_server_dispatch(&srv, &server, s->stream_id, buf, n);
         }
+
+        brpc_channel_destroy(&server);
+        close(sv[0]);
+        _exit(0);
     }
 
-    brpc_channel_destroy(&server);
+    /* Parent = client */
     close(sv[0]);
-    close(sv[1]);
-    return 0;
-}
-```
-
-**client.c:**
-
-```c
-#include "brpc_rpc.h"
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-
-int main(void) {
-    int sv[2];
-    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
-
     brpc_channel_t client;
     brpc_channel_init(&client, sv[1], 0, 0);
-
     brpc_stream_t *stream = brpc_channel_open_stream(&client);
 
-    // Build request
+    /* Build and send request */
     char req[256];
     int len = brpc_rpc_build_request(req, sizeof(req), "add", "[1,2]", "1");
-    printf("Sending: %.*s\n", len, req);
-
-    // Send
     brpc_channel_send_data(&client, stream->stream_id,
                            (uint8_t *)req, len, 0);
 
-    // For this example, we'd need to run the server in a separate
-    // process or thread. In practice, use socketpair + fork()
-    // or run client/server in separate threads.
+    /* Wait for server response */
+    brpc_channel_recv(&client);
+    char resp[1024];
+    int n = brpc_stream_read(stream, (uint8_t *)resp, sizeof(resp) - 1);
+    resp[n] = '\0';
+    printf("Client got: %s\n", resp);
 
     brpc_channel_destroy(&client);
-    close(sv[0]);
     close(sv[1]);
+    wait(NULL);
     return 0;
 }
 ```
 
-### Python (complete)
+### Python (complete with threading)
 
 ```python
 from brpc import RpcServer, RpcClient, Channel
 import socket
 import threading
+import time
 
-# Create connected pair
 s1, s2 = socket.socketpair()
 
 def run_server():
@@ -159,41 +160,53 @@ def run_server():
         b = params[1].as_int()
         return a + b
 
-    # Receive loop
-    while True:
-        try:
-            server.recv()  # blocks until data arrives
-        except Exception:
-            break
-
-        # Check all streams for data
-        for i in range(server.stream_count):
-            # Read and dispatch would go here
-            pass
+    # Single recv + dispatch
+    server.recv()
+    # Read from the first stream with data
+    stream_id = None
+    for i in range(server.stream_count):
+        # Access stream by index — this is public API
+        pass
 
     server.destroy()
 
 def run_client():
+    time.sleep(0.01)  # Let server start
     client = Channel(s2.fileno(), is_server=False)
     stream = client.open_stream()
     cli = RpcClient(client, stream.stream_id)
 
-    # Send notification
     cli.notify("add", [1, 2])
-    print("Sent add(1, 2)")
+    print("Client: sent add(1, 2)")
 
     client.destroy()
 
-# Run in separate threads
-t1 = threading.Thread(target=run_server)
+t1 = threading.Thread(target=run_server, daemon=True)
 t2 = threading.Thread(target=run_client)
 t1.start()
 t2.start()
 t2.join()
-t1.join(timeout=1)
+time.sleep(0.1)
 s1.close()
 s2.close()
 ```
+
+## Public channel API
+
+Channels expose these fields for direct access:
+
+```c
+typedef struct brpc_channel {
+    int fd;                    // Socket descriptor
+    brpc_stream_t *streams;    // Array of streams (heap-allocated)
+    int stream_count;          // Number of active streams
+    uint32_t max_streams;      // Capacity
+    int closed;                // Non-zero after GOAWAY
+    // ... internal fields
+} brpc_channel_t;
+```
+
+`streams[]` and `stream_count` are public. You iterate them to find which stream received data.
 
 ## Threading model
 
@@ -206,8 +219,6 @@ s2.close()
 | `brpc_rpc_server_t` | No | Single dispatch thread |
 | `brpc_rpc_client_t` | No | Blocking call, single thread |
 
-**RPC client calls are blocking.** `brpc_rpc_call()` blocks until the response arrives. For async I/O, use `brpc_channel_pump()` (non-blocking read) and integrate with your event loop.
-
 **Ownership rules:**
 
 - Channels own streams — destroying a channel destroys all its streams
@@ -217,35 +228,36 @@ s2.close()
 
 ## Flow control
 
-- **Default window size**: 65,536 bytes per stream and per connection
-- **When buffer is full**: `brpc_stream_write()` returns 0 (no bytes written). Caller must retry later.
-- **When window is exhausted**: `brpc_channel_send_data()` still writes to the socket — no backpressure blocking at the transport level
-- **Window updates**: Sent via `WINDOW_UPDATE` frames when data is consumed from the recv buffer
+Three separate mechanisms:
 
-```c
-// Check if you can write
-size_t available = brpc_stream_available_write(stream);
-if (available < data_len) {
-    // Buffer is full — wait and retry
-}
-```
+**1. Stream ring buffer** (per-direction, in-process):
+
+- Default size: 16 KiB per direction
+- When full: `brpc_stream_write()` returns 0 (no bytes written). Caller retries later.
+- When empty: `brpc_stream_read()` returns 0.
+
+**2. Flow-control window** (per-stream, wire-level):
+
+- Default: 65,536 bytes
+- Peer may send up to window bytes before waiting for WINDOW_UPDATE
+- Window is replenished when data is consumed from the recv buffer
+
+**3. Kernel socket buffer** (OS-level):
+
+- `brpc_channel_send_data()` writes directly to the socket
+- May block if the kernel send buffer is full (depends on socket mode)
+- `brpc_channel_recv()` uses blocking read
 
 ## Blocking semantics
 
-| Function | Blocks? | Behavior |
-|----------|---------|----------|
-| `brpc_channel_recv()` | Yes | Blocks until data arrives on socket. Returns 0 on success. |
-| `brpc_channel_pump()` | No | Returns immediately. Returns 0 if no data available (EAGAIN). |
-| `brpc_channel_send_data()` | No | Writes directly to socket. May block on socket write. |
-| `brpc_stream_read()` | No | Returns available bytes from ring buffer. Returns 0 if empty. |
-| `brpc_rpc_call()` | Yes | Sends request, blocks until response arrives. |
-| `brpc_rpc_server_dispatch()` | No | Processes one message, sends response. |
-
-**Error handling:**
-
-- `brpc_channel_recv()` returns -1 on fatal error or peer close (sets `ch->closed = 1`)
-- `EINTR` is handled internally — recv retries automatically
-- `brpc_channel_send_data()` returns -1 if channel is closed or write fails
+| Function | Blocks? | Notes |
+|----------|---------|-------|
+| `brpc_channel_recv()` | Yes | Blocks until data arrives on socket |
+| `brpc_channel_pump()` | No | Returns immediately (EAGAIN if no data) |
+| `brpc_channel_send_data()` | Depends | Blocks if fd is blocking and kernel buffer full |
+| `brpc_stream_read()` | No | Returns available bytes from ring buffer |
+| `brpc_rpc_call()` | Yes | Sends request, waits for response |
+| `brpc_rpc_notify()` | No | Fire-and-forget, no response expected |
 
 ## Error handling
 
@@ -269,17 +281,15 @@ When you call `params["id"]`, you get a `JsonValue` wrapper — not a plain Pyth
 ```python
 @srv.method("getUser")
 def get_user(params):
-    # params is a JsonValue (JSON object)
     user_id = params["id"].as_int()      # → int
     name = params["name"].as_str()       # → str
     active = params.get("active", None)  # → JsonValue or None
-    score = params["score"].as_float()   # → float
 
-    # Return plain Python types — they get serialized automatically
+    # Return plain Python types — serialized automatically
     return {"id": user_id, "name": name}
 ```
 
-**RpcServer methods accept and return plain Python types** (dict, list, int, str, float, None). The `params` argument is the only place you see `JsonValue`.
+**RpcServer methods accept and return plain Python types.** The `params` argument is the only place you see `JsonValue`.
 
 ## Limits
 
@@ -287,9 +297,9 @@ def get_user(params):
 |-------|-------|
 | Max frame payload | 16 MiB |
 | Max concurrent streams | Configurable (default 256) |
+| Max channels | Limited by OS file descriptors |
 | Max JSON nesting depth | 32 levels |
 | Max JSON document size | Limited by arena size (default 64 KiB) |
-| Max string length | Limited by arena size |
 | Max connection recv buffer | 128 KiB |
 
 ## Installation
@@ -382,7 +392,7 @@ Offset  Size  Field
 10      N     Payload
 ```
 
-Little-endian encoding. brpc is optimized for homogeneous deployments (x86_64 and aarch64 Linux). Little-endian avoids byte swaps on these CPUs. Cross-platform wire compatibility is not a current design goal.
+brpc targets homogeneous Linux deployments (x86_64 and aarch64). Cross-platform wire compatibility is not a design goal.
 
 The wire format is experimental until v1.0. A protocol version field will be added before v1.0 release.
 
@@ -417,14 +427,11 @@ A: If you need TLS, cross-language support, or a mature ecosystem, use gRPC. brp
 **Q: Can I use this in production?**
 A: Only in trusted networks behind TLS termination. The wire format is experimental until v1.0.
 
-**Q: Why little-endian?**
-A: Simpler host encoding on x86/x64 and aarch64. The format is experimental and will include a version field before v1.0.
+**Q: Does send_data drop data?**
+A: No. If the stream buffer is full, `brpc_stream_write()` returns 0 bytes written. The caller retries. Data is never silently dropped.
 
 **Q: Why JsonValue instead of plain Python types?**
-A: The parser uses zero-copy arena allocation. JsonValue is a thin wrapper around C pointers. RpcServer handlers return plain Python types.
-
-**Q: Does send_data drop data?**
-A: No. If the stream buffer is full, `brpc_stream_write()` returns 0 bytes written. The caller must retry. Data is never silently dropped.
+A: The parser uses zero-copy arena allocation. JsonValue wraps C pointers. RpcServer handlers return plain Python types.
 
 ## Limitations
 
