@@ -1,13 +1,10 @@
 # Build artifacts
+build/
 *.o
 *.so
 *.dylib
 *.a
 *.exe
-brpc_demo
-test_brpc
-main
-libbrpc.so
 
 # Python
 __pycache__/
@@ -15,7 +12,6 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
-build/
 .venv/
 .pytest_cache/
 .mypy_cache/
@@ -39,4 +35,6 @@ Thumbs.db
 # Profiling data
 *.prof
 profile.csv
-bench
+
+# Debug binaries
+test_brpc_debug
