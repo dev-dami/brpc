@@ -139,7 +139,7 @@ int main(void) {
 }
 ```
 
-### Python (minimal example)
+### Python (client + server with threads)
 
 ```python
 from brpc import RpcServer, RpcClient, Channel
@@ -159,21 +159,27 @@ def run_server():
         b = params[1].as_int()
         return a + b
 
-    # Single recv + dispatch
+    # Recv, find ready streams, dispatch each request
     server.recv()
-    # In real code, iterate ready streams and dispatch each
-    # The Python Channel object exposes .stream_count and indexing
+    s = None
+    while (s := server.next_ready_stream(s.stream_id if s else 0)):
+        data = s.read()
+        resp = srv.dispatch(data)
+        if resp:
+            server.send_data(s.stream_id, resp.encode())
 
     server.destroy()
 
 def run_client():
-    time.sleep(0.01)  # Let server start
+    time.sleep(0.01)
     client = Channel(s2.fileno(), is_server=False)
     stream = client.open_stream()
     cli = RpcClient(client, stream.stream_id)
 
-    cli.notify("add", [1, 2])
-    print("Client: sent add(1, 2)")
+    # Synchronous RPC call
+    cli.send_data = client.send_data  # needed for call
+    response = cli.call("add", [1, 2])
+    print(f"Client got: {response}")
 
     client.destroy()
 
@@ -185,6 +191,51 @@ t2.join()
 time.sleep(0.1)
 s1.close()
 s2.close()
+```
+
+### Python asyncio
+
+```python
+import asyncio
+import socket
+from brpc import AsyncChannel, AsyncRpcClient, RpcServer
+
+async def main():
+    s1, s2 = socket.socketpair()
+
+    # Server in background thread
+    def server_work():
+        ch = Channel(s1.fileno(), is_server=True)
+        srv = RpcServer()
+
+        @srv.method("add")
+        def handle_add(params):
+            return params[0].as_int() + params[1].as_int()
+
+        ch.recv()
+        s = None
+        while (s := ch.next_ready_stream(s.stream_id if s else 0)):
+            data = s.read()
+            resp = srv.dispatch(data)
+            if resp:
+                ch.send_data(s.stream_id, resp.encode())
+        ch.destroy()
+
+    import threading
+    t = threading.Thread(target=server_work, daemon=True)
+    t.start()
+
+    # Async client
+    async with AsyncChannel(s2.fileno()) as ach:
+        stream = ach.open_stream()
+        cli = AsyncRpcClient(ach, stream.stream_id)
+        result = await cli.call("add", [3, 4])
+        print(f"Result: {result}")
+
+    s1.close()
+    s2.close()
+
+asyncio.run(main())
 ```
 
 ## Public channel API
@@ -343,23 +394,28 @@ def get_user(params):
 ### C (from source)
 
 ```bash
-# Build shared library
-zig cc -shared -fPIC -O2 -Iinclude -o libbrpc.so src/*.c -lm
-
-# Or use make
-make all        # builds demo, tests, benchmarks
-make test       # runs 79 C tests
+make all            # builds demo, tests, benchmarks to build/
+make test           # runs 108 C tests
+make run            # runs the demo
+make bench          # runs benchmarks
+make clean          # removes build/
 ```
-
-**Supported platforms**: Linux (x86_64, aarch64). Other POSIX systems may work but are untested.
 
 ### Python
 
 ```bash
+# Install system-wide
+make install-python
+
+# Or install in development mode (editable)
+make install-python-dev
+
+# Or build shared library and run tests only
+make python-test
+
+# Manual install (requires uv or pip)
 cd python/brpc
-uv sync && uv run pytest tests/ -v
-# or
-pip install -e ".[dev]" && pytest tests/ -v
+uv pip install -e ".[dev]"
 ```
 
 ## Performance
