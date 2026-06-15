@@ -220,11 +220,11 @@ const char *brpc_error_string(err);  /* human-readable */
 │ Arena parser +  │ Multiplexed TCP channel        │
 │ streaming writer│ (TLS, compression, SETTINGS)   │
 ├─────────────────┼──────────┬─────────────────────┤
-│                 │brpc_frame│   brpc_stream        │
-│                 │ 10-byte  │ Bidirectional        │
-│                 │ LE hdr   │ ring buffers         │
+│                 │brpc_frame│   brpc_stream       │
+│                 │ 10-byte  │ Bidirectional       │
+│                 │ LE hdr   │ ring buffers        │
 ├─────────────────┴──────────┴─────────────────────┤
-│                 brpc_prof + brpc_stats            │
+│                 brpc_prof + brpc_stats           │
 │        Microsecond profiling + counters          │
 └──────────────────────────────────────────────────┘
 ```
@@ -264,7 +264,7 @@ The wire format is experimental until v1.0.
 
 ## Performance
 
-Measured on AMD Ryzen 7 5800X, Linux 6.x, `cc -O2`, single thread, `socketpair(AF_UNIX)`:
+Measured on Intel i8 3rd gen, Linux 7.x, `cc -O2`, single thread, `socketpair(AF_UNIX)`:
 
 | Operation | Latency | Throughput |
 |-----------|---------|------------|
