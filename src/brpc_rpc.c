@@ -255,6 +255,73 @@ int brpc_rpc_call(brpc_rpc_client_t *cli, const char *method,
     return 0;
 }
 
+int brpc_rpc_call_json(brpc_rpc_client_t *cli, const char *method,
+                       json_value_t *params, json_arena_t *resp_arena,
+                       json_value_t **result)
+{
+    /* Serialize params to JSON string. */
+    char params_buf[4096];
+    if (params) {
+        size_t params_len = 0;
+        if (json_serialize(params, params_buf, sizeof(params_buf), &params_len) != 0) {
+            return -1;
+        }
+        params_buf[params_len] = '\0';
+    }
+
+    /* Build request with numeric ID. */
+    char id_str[32];
+    static int next_id = 1;
+    snprintf(id_str, sizeof(id_str), "%d", next_id++);
+
+    char req_buf[4096];
+    int req_len = brpc_rpc_build_request(req_buf, sizeof(req_buf),
+                                         method,
+                                         params ? params_buf : NULL,
+                                         id_str);
+    if (req_len < 0) return -1;
+
+    /* Send request. */
+    int rc = brpc_channel_send_data(cli->ch, cli->stream_id,
+                                    (const uint8_t *)req_buf,
+                                    (size_t)req_len, 0);
+    if (rc != 0) return -1;
+
+    /* Receive response. */
+    rc = brpc_channel_recv(cli->ch);
+    if (rc != 0) return -1;
+
+    /* Read from stream. */
+    brpc_stream_t *s = brpc_channel_find_stream(cli->ch, cli->stream_id);
+    if (!s) return -1;
+
+    size_t available = brpc_stream_available_read(s);
+    if (available == 0) return -1;
+
+    char resp_buf[8192];
+    if (available > sizeof(resp_buf) - 1) available = sizeof(resp_buf) - 1;
+
+    int n = brpc_stream_read(s, (uint8_t *)resp_buf, available);
+    if (n <= 0) return -1;
+    resp_buf[n] = '\0';
+
+    /* Parse response. */
+    json_parser_t p;
+    json_arena_reset(resp_arena);
+    if (json_parse(&p, resp_buf, (size_t)n, resp_arena, result) != 0) {
+        return BRPC_RPC_ERROR_PARSE;
+    }
+
+    /* Check for error in response. */
+    json_value_t *err = json_obj_get(*result, "error");
+    if (err && err->type == JSON_OBJECT) {
+        json_value_t *code = json_obj_get(err, "code");
+        if (code) return (int)json_get_int(code, BRPC_RPC_ERROR_INTERNAL);
+    }
+
+    return 0;
+}
+
 int brpc_rpc_notify(brpc_rpc_client_t *cli, const char *method,
                     const char *params)
 {

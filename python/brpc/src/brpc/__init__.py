@@ -2,7 +2,8 @@
 import ctypes
 import os
 
-__all__ = ["JsonParser", "JsonValue", "JsonWriter", "Stream", "Channel", "Profiler"]
+__all__ = ["JsonParser", "JsonValue", "JsonWriter", "Stream", "Channel",
+           "Profiler", "RpcServer", "RpcClient"]
 __version__ = "0.1.0"
 
 _lib_path = os.path.join(os.path.dirname(__file__), "_libbrpc.so")
@@ -163,12 +164,15 @@ class JsonParser:
 
 
 class JsonValue:
+    __slots__ = ("_v",)
+
     def __init__(self, v):
         self._v = v if isinstance(v, int) else v.value
 
     @property
     def type(self) -> str:
-        t = json_value_t.from_address(self._v).type
+        # Read the type field (first int32) directly from memory
+        t = ctypes.c_int.from_address(self._v).value
         return {0: "null", 1: "bool", 2: "int", 3: "float",
                 4: "string", 5: "array", 6: "object"}.get(t, "unknown")
 
@@ -187,6 +191,9 @@ class JsonValue:
 
     def as_bool(self, fallback: bool = False) -> bool:
         return bool(lib.json_get_bool(self._v, int(fallback)))
+
+    def __bool__(self):
+        return True  # A JsonValue that exists is always truthy
 
     def __len__(self) -> int:
         return lib.json_array_len(self._v)
@@ -354,3 +361,264 @@ class Profiler:
     @staticmethod
     def print():
         lib.brpc_prof_print()
+
+
+# ── RPC Layer ────────────────────────────────────────────────────────────
+
+lib.brpc_rpc_build_request.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                                        ctypes.c_char_p, ctypes.c_char_p,
+                                        ctypes.c_char_p]
+lib.brpc_rpc_build_request.restype = ctypes.c_int
+
+lib.brpc_rpc_build_response.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                                         ctypes.c_char_p, ctypes.c_char_p]
+lib.brpc_rpc_build_response.restype = ctypes.c_int
+
+lib.brpc_rpc_build_error.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                                      ctypes.c_char_p, ctypes.c_int,
+                                      ctypes.c_char_p]
+lib.brpc_rpc_build_error.restype = ctypes.c_int
+
+
+def _write_value(w, val):
+    """Write a Python value to a JsonWriter."""
+    if val is None:
+        w.null()
+    elif isinstance(val, bool):
+        w.bool(val)
+    elif isinstance(val, int):
+        w.int(val)
+    elif isinstance(val, float):
+        w.float(val)
+    elif isinstance(val, str):
+        w.str(val)
+    elif isinstance(val, bytes):
+        w.str(val.decode("utf-8"))
+    elif isinstance(val, dict):
+        w.obj_start()
+        for k, v in val.items():
+            w.obj_key(k)
+            _write_value(w, v)
+        w.obj_end()
+    elif isinstance(val, list):
+        w.arr_start()
+        for v in val:
+            _write_value(w, v)
+        w.arr_end()
+
+
+class RpcServer:
+    """JSON-RPC 2.0 server with method dispatch.
+
+    Usage:
+        srv = RpcServer()
+
+        @srv.method("getUser")
+        def get_user(params):
+            user_id = params["id"].as_int()
+            return {"name": "Alice", "id": user_id}
+
+        # In your recv loop:
+        response_json = srv.dispatch(data)
+        if response_json:
+            channel.send_data(stream_id, response_json.encode(), end_stream=False)
+    """
+
+    def __init__(self):
+        self._handlers = {}
+        self._parser = JsonParser()
+
+    def method(self, name):
+        """Decorator to register a method handler.
+
+        Handler signature: fn(params: JsonValue) -> any
+        """
+        def decorator(fn):
+            self._handlers[name] = fn
+            return fn
+        return decorator
+
+    def register(self, name, handler):
+        """Register a handler function for a method name."""
+        self._handlers[name] = handler
+
+    def dispatch(self, data):
+        """Dispatch an incoming JSON-RPC message.
+
+        Args:
+            data: Raw JSON-RPC message (str or bytes).
+
+        Returns:
+            JSON response string to send back, or None for notifications.
+        """
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+
+        try:
+            root = self._parser.parse(data)
+        except ValueError as e:
+            return self._build_error("null", -32700, str(e))
+
+        if root.type != "object":
+            return self._build_error("null", -32600, "Request must be a JSON object")
+
+        # Extract method
+        method_val = root.get("method")
+        if not method_val or method_val.type != "string":
+            return self._build_error("null", -32600, "Missing or invalid 'method'")
+
+        method_name = method_val.as_str()
+        params = root.get("params")
+        id_val = root.get("id")
+        is_notification = id_val is None or (hasattr(id_val, 'type') and id_val.type == "null")
+
+        # Find handler
+        handler = self._handlers.get(method_name)
+        if not handler:
+            if is_notification:
+                return None
+            return self._build_error(
+                self._id_str(id_val), -32601,
+                f"Method '{method_name}' not found"
+            )
+
+        # Call handler
+        try:
+            result = handler(params)
+        except Exception as e:
+            if is_notification:
+                return None
+            return self._build_error(self._id_str(id_val), -32603, str(e))
+
+        if is_notification:
+            return None
+
+        # Build response
+        return self._build_result(self._id_str(id_val), result)
+
+    def _id_str(self, id_val):
+        if id_val is None:
+            return "null"
+        if id_val.type == "int":
+            return str(id_val.as_int())
+        if id_val.type == "string":
+            return f'"{id_val.as_str()}"'
+        if id_val.type == "float":
+            return str(id_val.as_float())
+        return "null"
+
+    def _build_result(self, id_str, result):
+        w = JsonWriter()
+        w.obj_start()
+        w.obj_key("jsonrpc")
+        w.str("2.0")
+        w.obj_key("result")
+        _write_value(w, result)
+        w.obj_key("id")
+        # Write raw id (numeric or null)
+        id_bytes = id_str.encode("utf-8")
+        buf = (ctypes.c_char * len(id_bytes))()
+        ctypes.memmove(buf, id_bytes, len(id_bytes))
+        lib.json_write_raw(w._w, buf, len(id_bytes))
+        w.obj_end()
+        return w.finish().decode("utf-8")
+
+    def _build_error(self, id_str, code, message):
+        w = JsonWriter()
+        w.obj_start()
+        w.obj_key("jsonrpc")
+        w.str("2.0")
+        w.obj_key("error")
+        w.obj_start()
+        w.obj_key("code")
+        w.int(code)
+        w.obj_key("message")
+        w.str(message)
+        w.obj_end()
+        w.obj_key("id")
+        id_bytes = id_str.encode("utf-8")
+        buf = (ctypes.c_char * len(id_bytes))()
+        ctypes.memmove(buf, id_bytes, len(id_bytes))
+        lib.json_write_raw(w._w, buf, len(id_bytes))
+        w.obj_end()
+        return w.finish().decode("utf-8")
+
+
+class RpcClient:
+    """JSON-RPC 2.0 client with synchronous calls.
+
+    Usage:
+        cli = RpcClient(channel, stream_id)
+
+        # Synchronous call
+        result = cli.call("getUser", {"id": 1})
+        print(result["name"].as_str())
+
+        # Fire-and-forget notification
+        cli.notify("logEvent", {"event": "click"})
+    """
+
+    def __init__(self, channel, stream_id):
+        self._ch = channel
+        self._stream_id = stream_id
+
+    def call(self, method, params=None):
+        """Call a remote method and return raw JSON response.
+
+        Args:
+            method: Method name.
+            params: Params dict/list/value (will be serialized to JSON).
+
+        Returns:
+            Raw JSON response string.
+        """
+        # Serialize params
+        params_json = None
+        if params is not None:
+            w = JsonWriter()
+            _write_value(w, params)
+            params_json = w.finish()
+
+        # Build request
+        id_val = f'"{id(self) % 10000}"'
+        buf = (ctypes.c_char * 4096)()
+        lib.brpc_rpc_build_request(buf, len(buf),
+                                    method.encode("utf-8"),
+                                    params_json if params_json else None,
+                                    id_val.encode("utf-8"))
+        req = buf.value
+
+        # Send request
+        self._ch.send_data(self._stream_id, req, end_stream=False)
+
+        # Receive response
+        self._ch.recv()
+
+        # Read from stream
+        stream = self._ch.find_stream(self._stream_id)
+        if not stream:
+            return None
+        available = stream.available_read
+        if available == 0:
+            return None
+        return stream.read(available).decode("utf-8")
+
+    def notify(self, method, params=None):
+        """Send a notification (no response expected).
+
+        Args:
+            method: Method name.
+            params: Params dict/list/value.
+        """
+        params_json = None
+        if params is not None:
+            w = JsonWriter()
+            _write_value(w, params)
+            params_json = w.finish()
+
+        buf = (ctypes.c_char * 4096)()
+        lib.brpc_rpc_build_request(buf, len(buf),
+                                    method.encode("utf-8"),
+                                    params_json if params_json else None,
+                                    b"null")
+        self._ch.send_data(self._stream_id, buf.value, end_stream=False)

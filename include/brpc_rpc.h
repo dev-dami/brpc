@@ -153,10 +153,10 @@ void brpc_rpc_client_init(brpc_rpc_client_t *cli,
                           brpc_channel_t *ch, uint32_t stream_id);
 
 /**
- * Call a remote method and wait for the response.
+ * Call a remote method and wait for the response (raw string API).
  *
  * Sends a JSON-RPC request, blocks until the response arrives,
- * and parses it.
+ * and returns the raw JSON response.
  *
  * @param method    Method name.
  * @param params    JSON-encoded params string (or NULL for no params).
@@ -166,6 +166,25 @@ void brpc_rpc_client_init(brpc_rpc_client_t *cli,
  */
 int brpc_rpc_call(brpc_rpc_client_t *cli, const char *method,
                   const char *params, char *resp_buf, size_t buf_len);
+
+/**
+ * Call a remote method with json_value_t params (ergonomic API).
+ *
+ * Serializes params to JSON, sends the request, waits for response,
+ * and parses the response into a json_value_t tree.
+ *
+ * The caller must provide an arena for parsing the response.
+ * The arena must outlive the returned json_value_t.
+ *
+ * @param method    Method name.
+ * @param params    Parsed params value (or NULL for no params).
+ * @param resp_arena Arena for parsing the response.
+ * @param result    Output: parsed response value (or NULL on error).
+ * @return 0 on success, negative error code.
+ */
+int brpc_rpc_call_json(brpc_rpc_client_t *cli, const char *method,
+                       json_value_t *params, json_arena_t *resp_arena,
+                       json_value_t **result);
 
 /**
  * Send a notification (no response expected).

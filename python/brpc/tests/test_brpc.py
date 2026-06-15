@@ -1,13 +1,14 @@
 """Unit tests for brpc Python bindings."""
 import pytest
 import socket
+import ctypes
 import sys
 import os
 
 # Ensure the shared library is findable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from brpc import JsonParser, JsonWriter, Stream, Channel, Profiler
+from brpc import JsonParser, JsonWriter, Stream, Channel, Profiler, RpcServer, RpcClient
 
 
 class TestJsonParser:
@@ -211,3 +212,81 @@ class TestProfiler:
         Profiler.init()
         Profiler.reset()
         Profiler.print()
+
+
+class TestRpcServer:
+    def test_init(self):
+        srv = RpcServer()
+        assert srv is not None
+
+    def test_register(self):
+        srv = RpcServer()
+        srv.register("echo", lambda p: None)
+        assert srv is not None
+
+    def test_decorator(self):
+        srv = RpcServer()
+
+        @srv.method("add")
+        def add_handler(params):
+            return None
+
+        assert srv is not None
+
+    def test_dispatch(self):
+        srv = RpcServer()
+
+        @srv.method("ping")
+        def ping_handler(params):
+            return "pong"
+
+        resp = srv.dispatch('{"jsonrpc":"2.0","method":"ping","id":1}')
+        assert resp is not None
+        assert '"result"' in resp
+        assert '"pong"' in resp
+
+    def test_dispatch_notification(self):
+        srv = RpcServer()
+
+        @srv.method("ping")
+        def ping_handler(params):
+            return "pong"
+
+        resp = srv.dispatch('{"jsonrpc":"2.0","method":"ping"}')
+        assert resp is None
+
+    def test_dispatch_unknown_method(self):
+        srv = RpcServer()
+        resp = srv.dispatch('{"jsonrpc":"2.0","method":"nope","id":1}')
+        assert resp is not None
+        assert '-32601' in resp
+
+    def test_dispatch_invalid_json(self):
+        srv = RpcServer()
+        resp = srv.dispatch("not json")
+        assert resp is not None
+        assert '-32700' in resp
+
+    def test_dispatch_with_dict_result(self):
+        srv = RpcServer()
+
+        @srv.method("getUser")
+        def get_user(params):
+            return {"name": "Alice", "id": 42}
+
+        resp = srv.dispatch('{"jsonrpc":"2.0","method":"getUser","id":1}')
+        assert resp is not None
+        assert '"name"' in resp
+        assert '"Alice"' in resp
+
+
+class TestRpcClient:
+    def test_init(self):
+        s1, s2 = socket.socketpair()
+        ch = Channel(s1.fileno(), is_server=False)
+        cs = ch.open_stream()
+        cli = RpcClient(ch, cs.stream_id)
+        assert cli is not None
+        ch.destroy()
+        s1.close()
+        s2.close()

@@ -14,12 +14,12 @@ brpc sits between 2 and 3: binary-framed multiplexed streams with JSON payloads,
 
 ## What brpc provides
 
-- **Arena-based JSON parsing and serialization** — zero-allocation, ~0.1-2µs per message
-- **Binary framing** — 10-byte LE header per frame (justified: cheaper host encoding on x86/x64)
+- **JSON-RPC 2.0 abstraction** — method dispatch, handlers, error propagation
+- **Arena-based JSON parsing and serialization** — zero-allocation, fast
+- **Binary framing** — 10-byte LE header per frame
 - **Multiplexed bidirectional streams** — configurable concurrent streams over one TCP connection
-- **Flow control** — connection and stream receive windows (application-level backpressure callbacks not yet implemented)
-- **JSON-RPC 2.0 abstraction** — request/response, method dispatch, error propagation
-- **Python bindings** — ctypes-based, no codegen needed
+- **Flow control** — connection and stream receive windows
+- **Python bindings** — ergonomic API with decorators
 - **Profiling** — microsecond-granularity counters for every hot path
 
 ## When to use this
@@ -76,12 +76,25 @@ brpc_rpc_server_dispatch(&srv, &channel, stream_id, recv_buf, recv_len);
 brpc_rpc_client_t cli;
 brpc_rpc_client_init(&cli, &channel, stream_id);
 
-// Synchronous call
-char response[4096];
-brpc_rpc_call(&cli, "getUser", "{\"id\":1}", response, sizeof(response));
+// Build params with JSON writer
+char params_buf[256];
+json_writer_t pw;
+json_writer_init(&pw, params_buf, sizeof(params_buf));
+json_write_obj_start(&pw);
+json_write_obj_key(&pw, "id", 2);
+json_write_int(&pw, 1);
+json_write_obj_end(&pw);
+json_writer_finish(&pw);
 
-// Fire-and-forget notification
-brpc_rpc_notify(&cli, "logEvent", "{\"event\":\"click\"}");
+// Call (takes raw JSON string)
+char response[4096];
+brpc_rpc_call(&cli, "getUser", params_buf, response, sizeof(response));
+
+// Or use the ergonomic API with json_value_t
+json_arena_t resp_arena;
+json_arena_init(&resp_arena, arena_buf, sizeof(arena_buf));
+json_value_t *result;
+brpc_rpc_call_json(&cli, "getUser", params_value, &resp_arena, &result);
 ```
 
 ### JSON (standalone)
@@ -110,6 +123,30 @@ json_writer_finish(&w);
 ```
 
 ### Python
+
+**RPC (the main API):**
+
+```python
+from brpc import RpcServer, RpcClient
+
+# Server
+srv = RpcServer()
+
+@srv.method("getUser")
+def get_user(params):
+    user_id = params["id"].as_int()
+    return {"name": "Alice", "id": user_id}
+
+# In your recv loop:
+response_json = srv.dispatch(data)
+
+# Client
+cli = RpcClient(channel, stream_id)
+result = cli.call("getUser", {"id": 1})
+# result is raw JSON string
+```
+
+**JSON (standalone):**
 
 ```python
 from brpc import JsonParser, JsonWriter
@@ -170,7 +207,21 @@ Measured on x86-64 Linux, `zig cc -O2`, single thread, `socketpair(AF_UNIX)`:
 
 C-level numbers. Python ctypes FFI adds ~2-3µs overhead per call.
 
-## Architecture
+## Comparison
+
+| | brpc | gRPC | Raw TCP + JSON |
+|---|---|---|---|
+| RTT (socketpair) | 2.4µs | ~100µs+ | ~1µs |
+| Multiplexing | Yes | Yes | No |
+| Flow control | Yes | Yes | No |
+| TLS | No | Yes | No |
+| Codegen | No | Yes (Protobuf) | No |
+| Streaming | Yes | Yes | Manual |
+| Language support | C, Python | 10+ | Any |
+| LOC | ~2000 | ~50,000+ | ~200 |
+| JSON-RPC 2.0 | Built-in | No | Manual |
+
+brpc trades TLS, cross-language support, and ecosystem for simplicity and speed.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -203,7 +254,7 @@ Offset  Size  Field
 10      N     Payload
 ```
 
-Little-endian chosen for cheaper host encoding on x86/x64. May change in v1.
+Frames use little-endian encoding. The wire format is experimental until v1.0.
 
 ## Stream lifecycle
 
