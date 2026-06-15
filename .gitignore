@@ -1,0 +1,41 @@
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.a
+*.exe
+brpc_demo
+test_brpc
+main
+libbrpc.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Zig
+.zig-cache/
+zig-out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Profiling data
+*.prof
+profile.csv

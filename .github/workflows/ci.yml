@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-c:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make all
+      - name: Run C tests
+        run: make test
+
+  test-python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build shared library
+        run: gcc -shared -fPIC -O2 -Iinclude -o python/brpc/src/brpc/_libbrpc.so src/*.c -lm
+      - name: Install dependencies
+        working-directory: python/brpc
+        run: uv sync
+      - name: Run Python tests
+        working-directory: python/brpc
+        run: uv run pytest tests/ -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check C formatting
+        run: |
+          sudo apt-get install -y clang-format
+          find src include -name '*.c' -o -name '*.h' | xargs clang-format --dry-run --Werror
