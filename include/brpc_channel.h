@@ -100,6 +100,33 @@ int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server,
 void brpc_channel_destroy(brpc_channel_t *ch);
 
 /**
+ * Get the number of active streams.
+ */
+int brpc_channel_stream_count(const brpc_channel_t *ch);
+
+/**
+ * Get a stream by index (0 to stream_count-1).
+ * Returns NULL if index is out of range.
+ */
+brpc_stream_t *brpc_channel_get_stream(const brpc_channel_t *ch, int index);
+
+/**
+ * Find the next stream that has data available for reading.
+ * Call repeatedly to iterate all ready streams.
+ *
+ * @param ch        The channel.
+ * @param last_id   Stream ID to continue from (0 to start from beginning).
+ * @return Stream with data available, or NULL if none.
+ */
+brpc_stream_t *brpc_channel_next_ready_stream(const brpc_channel_t *ch,
+                                               uint32_t last_id);
+
+/**
+ * Check if the channel is closed (GOAWAY received/sent).
+ */
+int brpc_channel_is_closed(const brpc_channel_t *ch);
+
+/**
  * Open a new locally-initiated stream.
  *
  * @return Pointer to the initialised stream, or NULL if the maximum

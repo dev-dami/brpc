@@ -26,7 +26,7 @@ brpc does NOT optimize for:
 
 JSON is slower than Protobuf, but:
 
-- Human-readable — debug with tcpdump or printf
+- Human-readable JSON payloads — easy to inspect in logs or packet captures
 - No schema compiler needed
 - Dynamic payloads without codegen
 - Familiar to Python and JavaScript developers
@@ -100,9 +100,10 @@ int main(void) {
         /* Blocking recv — waits for client request */
         brpc_channel_recv(&server);
 
-        /* Dispatch from the first active stream */
-        if (server.stream_count > 0) {
-            brpc_stream_t *s = &server.streams[0];
+        /* Find stream with data using accessor */
+        brpc_stream_t *s = NULL;
+        while ((s = brpc_channel_next_ready_stream(&server,
+                    s ? s->stream_id : 0)) != NULL) {
             char buf[1024];
             int n = brpc_stream_read(s, (uint8_t *)buf, sizeof(buf) - 1);
             buf[n] = '\0';
@@ -162,11 +163,8 @@ def run_server():
 
     # Single recv + dispatch
     server.recv()
-    # Read from the first stream with data
-    stream_id = None
-    for i in range(server.stream_count):
-        # Access stream by index — this is public API
-        pass
+    # In real code, iterate ready streams and dispatch each
+    # The Python Channel object exposes .stream_count and indexing
 
     server.destroy()
 
@@ -193,20 +191,28 @@ s2.close()
 
 ## Public channel API
 
-Channels expose these fields for direct access:
+Channels use accessor functions — internal struct is opaque:
 
 ```c
-typedef struct brpc_channel {
-    int fd;                    // Socket descriptor
-    brpc_stream_t *streams;    // Array of streams (heap-allocated)
-    int stream_count;          // Number of active streams
-    uint32_t max_streams;      // Capacity
-    int closed;                // Non-zero after GOAWAY
-    // ... internal fields
-} brpc_channel_t;
-```
+// Check if closed
+if (brpc_channel_is_closed(&server)) { ... }
 
-`streams[]` and `stream_count` are public. You iterate them to find which stream received data.
+// Get stream count
+int count = brpc_channel_stream_count(&server);
+
+// Iterate streams by index
+for (int i = 0; i < count; i++) {
+    brpc_stream_t *s = brpc_channel_get_stream(&server, i);
+    // ...
+}
+
+// Find streams with pending data (preferred)
+brpc_stream_t *s = NULL;
+while ((s = brpc_channel_next_ready_stream(&server,
+            s ? s->stream_id : 0)) != NULL) {
+    // s has data available for reading
+}
+```
 
 ## Threading model
 
@@ -247,6 +253,27 @@ Three separate mechanisms:
 - `brpc_channel_send_data()` writes directly to the socket
 - May block if the kernel send buffer is full (depends on socket mode)
 - `brpc_channel_recv()` uses blocking read
+
+## Protocol guarantees
+
+**Ordering:**
+- In-order delivery within a stream (A, B, C arrives as A, B, C)
+- No ordering guarantees across streams (stream 1 and stream 3 may interleave)
+
+**Atomicity:**
+- Each `brpc_channel_send_data()` call produces one DATA frame
+- The receiver gets the full payload in one `on_data` callback
+- Partial reads are not possible at the frame level
+
+**Stream fairness:**
+- Streams are serviced in order of arrival (FIFO per connection)
+- No round-robin or priority scheduling
+- A flooding stream can delay others on the same connection
+
+**Stream lifecycle:**
+- Closed streams never reopen
+- New streams get new IDs (monotonically increasing)
+- Stream IDs follow parity: client=odd, server=even
 
 ## Blocking semantics
 

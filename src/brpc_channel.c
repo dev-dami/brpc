@@ -431,6 +431,45 @@ brpc_stream_t *brpc_channel_find_stream(brpc_channel_t *ch,
     return NULL;
 }
 
+int brpc_channel_stream_count(const brpc_channel_t *ch)
+{
+    return ch ? ch->stream_count : 0;
+}
+
+brpc_stream_t *brpc_channel_get_stream(const brpc_channel_t *ch, int index)
+{
+    if (!ch || index < 0 || index >= ch->stream_count) return NULL;
+    return (brpc_stream_t *)&ch->streams[index];
+}
+
+brpc_stream_t *brpc_channel_next_ready_stream(const brpc_channel_t *ch,
+                                               uint32_t last_id)
+{
+    if (!ch || !ch->streams) return NULL;
+
+    int start = 0;
+    if (last_id != 0) {
+        for (int i = 0; i < ch->stream_count; i++) {
+            if (ch->streams[i].stream_id == last_id) {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+
+    for (int i = start; i < ch->stream_count; i++) {
+        if (brpc_stream_available_read(&ch->streams[i]) > 0) {
+            return (brpc_stream_t *)&ch->streams[i];
+        }
+    }
+    return NULL;
+}
+
+int brpc_channel_is_closed(const brpc_channel_t *ch)
+{
+    return ch ? ch->closed : 1;
+}
+
 int brpc_channel_send_frame(brpc_channel_t *ch, const brpc_frame_t *frame)
 {
     if (!ch || !frame) return -1;

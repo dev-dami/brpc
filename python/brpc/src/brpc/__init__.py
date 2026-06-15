@@ -131,6 +131,18 @@ lib.brpc_channel_recv.restype = ctypes.c_int
 lib.brpc_channel_pump.argtypes = [ctypes.c_void_p]
 lib.brpc_channel_pump.restype = ctypes.c_int
 
+lib.brpc_channel_stream_count.argtypes = [ctypes.c_void_p]
+lib.brpc_channel_stream_count.restype = ctypes.c_int
+
+lib.brpc_channel_get_stream.argtypes = [ctypes.c_void_p, ctypes.c_int]
+lib.brpc_channel_get_stream.restype = ctypes.c_void_p
+
+lib.brpc_channel_next_ready_stream.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+lib.brpc_channel_next_ready_stream.restype = ctypes.c_void_p
+
+lib.brpc_channel_is_closed.argtypes = [ctypes.c_void_p]
+lib.brpc_channel_is_closed.restype = ctypes.c_int
+
 lib.brpc_prof_init.argtypes = []
 lib.brpc_prof_init.restype = None
 lib.brpc_prof_reset.argtypes = []
@@ -320,7 +332,27 @@ class Channel:
 
     @property
     def stream_count(self) -> int:
-        return ctypes.c_int.from_buffer(self._buf, STREAM_COUNT_OFFSET).value
+        return lib.brpc_channel_stream_count(self._ch)
+
+    @property
+    def is_closed(self) -> bool:
+        return bool(lib.brpc_channel_is_closed(self._ch))
+
+    def get_stream(self, index: int):
+        """Get stream by index. Returns Stream or None."""
+        s = lib.brpc_channel_get_stream(self._ch, index)
+        if not s:
+            return None
+        sid = brpc_stream_t.from_address(s).stream_id
+        return Stream(sid)
+
+    def next_ready_stream(self, last_id: int = 0):
+        """Find next stream with data available. Returns Stream or None."""
+        s = lib.brpc_channel_next_ready_stream(self._ch, last_id)
+        if not s:
+            return None
+        sid = brpc_stream_t.from_address(s).stream_id
+        return Stream(sid)
 
     def open_stream(self) -> Stream:
         s = lib.brpc_channel_open_stream(self._ch)
