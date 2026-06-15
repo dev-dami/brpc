@@ -621,7 +621,7 @@ static void test_channel_basic(void) {
 
     TEST("channel init and destroy");
     brpc_channel_t ch;
-    if (brpc_channel_init(&ch, sv[0], 0) == 0 &&
+    if (brpc_channel_init(&ch, sv[0], 0, 0) == 0 &&
         ch.fd == sv[0] &&
         ch.is_server == 0 &&
         ch.next_stream_id == 1) {
@@ -630,7 +630,7 @@ static void test_channel_basic(void) {
     } else { FAIL("init failed"); }
 
     TEST("open stream");
-    brpc_channel_init(&ch, sv[0], 0);
+    brpc_channel_init(&ch, sv[0], 0, 0);
     brpc_stream_t *s = brpc_channel_open_stream(&ch);
     if (s && s->stream_id == 1 && ch.stream_count == 1) {
         PASS();
@@ -672,7 +672,7 @@ static void test_channel_send_data(void) {
 
     TEST("send data frame over channel");
     brpc_channel_t ch;
-    brpc_channel_init(&ch, sv[0], 0);
+    brpc_channel_init(&ch, sv[0], 0, 0);
     brpc_stream_t *s = brpc_channel_open_stream(&ch);
 
     const char *payload = "test payload";
@@ -697,7 +697,7 @@ static void test_channel_send_data(void) {
 
     TEST("send data on non-existent stream fails");
     brpc_channel_t ch2;
-    brpc_channel_init(&ch2, sv[1], 1);
+    brpc_channel_init(&ch2, sv[1], 1, 0);
     if (brpc_channel_send_data(&ch2, 999,
                                (const uint8_t *)"x", 1, 0) == -1) {
         PASS();
@@ -730,7 +730,7 @@ static void test_json_over_channel(void) {
     TEST("JSON serialization over bRPC channel");
     /* Client side */
     brpc_channel_t client;
-    brpc_channel_init(&client, sv[0], 0);
+    brpc_channel_init(&client, sv[0], 0, 0);
     brpc_stream_t *cs = brpc_channel_open_stream(&client);
 
     /* Build a JSON RPC request */
@@ -758,7 +758,7 @@ static void test_json_over_channel(void) {
 
     /* Server side receives */
     brpc_channel_t server;
-    brpc_channel_init(&server, sv[1], 1);
+    brpc_channel_init(&server, sv[1], 1, 0);
 
     /* Set up on_new_stream callback */
     static char server_buf[512];

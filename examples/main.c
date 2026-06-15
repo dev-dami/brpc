@@ -105,7 +105,7 @@ static void demo_brpc_channel(void) {
 
     /* Client */
     brpc_channel_t client;
-    brpc_channel_init(&client, sv[0], 0);
+    brpc_channel_init(&client, sv[0], 0, 0);
     brpc_stream_t *cs = brpc_channel_open_stream(&client);
 
     /* Build and send a JSON-RPC request */
@@ -126,7 +126,7 @@ static void demo_brpc_channel(void) {
 
     /* Server */
     brpc_channel_t server;
-    brpc_channel_init(&server, sv[1], 1);
+    brpc_channel_init(&server, sv[1], 1, 0);
 
     server_got_stream = 0;
     server.on_new_stream = on_new_stream_cb;

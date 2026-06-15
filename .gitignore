@@ -39,3 +39,4 @@ Thumbs.db
 # Profiling data
 *.prof
 profile.csv
+bench

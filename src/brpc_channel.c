@@ -99,7 +99,7 @@ static brpc_stream_t *find_or_create_stream(brpc_channel_t *ch,
     if (s) return s;
 
     if (!ch->is_server) return NULL;
-    if (ch->stream_count >= BRPC_MAX_STREAMS) return NULL;
+    if ((uint32_t)ch->stream_count >= ch->max_streams) return NULL;
 
     s = &ch->streams[ch->stream_count];
     if (brpc_stream_init(s, stream_id, BRPC_DEFAULT_STREAM_BUF_SIZE) != 0) {
@@ -347,7 +347,8 @@ static int parse_frames(brpc_channel_t *ch)
  * Public API
  * -------------------------------------------------------------------------- */
 
-int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server)
+int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server,
+                      uint32_t max_streams)
 {
     if (!ch) return -1;
 
@@ -362,13 +363,18 @@ int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server)
      */
     ch->next_stream_id = is_server ? 2 : 1;
 
+    /* Allocate stream table. */
+    if (max_streams == 0) max_streams = BRPC_MAX_STREAMS;
+    ch->max_streams = max_streams;
+    ch->streams = (brpc_stream_t *)calloc(max_streams, sizeof(brpc_stream_t));
+    if (!ch->streams) return -1;
+
     ch->conn_buf = (uint8_t *)malloc(BRPC_CONN_BUF_SIZE);
-    if (!ch->conn_buf) return -1;
+    if (!ch->streams) { free(ch->streams); return -1; }
 
     ch->conn_buf_size = BRPC_CONN_BUF_SIZE;
     ch->conn_buf_len  = 0;
 
-    ch->max_concurrent_streams = BRPC_MAX_STREAMS;
     ch->initial_window_size    = BRPC_DEFAULT_WINDOW_SIZE;
     ch->stream_count           = 0;
     ch->closed                 = 0;
@@ -388,6 +394,7 @@ void brpc_channel_destroy(brpc_channel_t *ch)
         brpc_stream_destroy(&ch->streams[i]);
     }
 
+    free(ch->streams);
     free(ch->conn_buf);
     memset(ch, 0, sizeof(*ch));
     ch->fd = -1;  /* Sentinel — we do NOT close the fd. */
@@ -396,7 +403,7 @@ void brpc_channel_destroy(brpc_channel_t *ch)
 brpc_stream_t *brpc_channel_open_stream(brpc_channel_t *ch)
 {
     if (!ch || ch->closed) return NULL;
-    if (ch->stream_count >= BRPC_MAX_STREAMS) return NULL;
+    if ((uint32_t)ch->stream_count >= ch->max_streams) return NULL;
 
     brpc_stream_t *s = &ch->streams[ch->stream_count];
 

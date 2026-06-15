@@ -110,9 +110,9 @@ lib.brpc_stream_available_read.restype = ctypes.c_size_t
 lib.brpc_stream_available_write.argtypes = [ctypes.POINTER(brpc_stream_t)]
 lib.brpc_stream_available_write.restype = ctypes.c_size_t
 
-CHANNEL_SIZE = 28752
-STREAM_COUNT_OFFSET = 28680  # 8 (fd+pad) + 256 * 112 (streams)
-lib.brpc_channel_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+CHANNEL_SIZE = 88  # sizeof(brpc_channel_t) with dynamic stream table
+STREAM_COUNT_OFFSET = 20  # offsetof(brpc_channel_t, stream_count)
+lib.brpc_channel_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
 lib.brpc_channel_init.restype = ctypes.c_int
 lib.brpc_channel_destroy.argtypes = [ctypes.c_void_p]
 lib.brpc_channel_destroy.restype = None
@@ -306,10 +306,10 @@ class Stream:
 
 
 class Channel:
-    def __init__(self, fd: int, is_server: bool = False):
+    def __init__(self, fd: int, is_server: bool = False, max_streams: int = 0):
         self._buf = (ctypes.c_char * CHANNEL_SIZE)()
         self._ch = ctypes.cast(self._buf, ctypes.c_void_p)
-        lib.brpc_channel_init(self._ch, fd, int(is_server))
+        lib.brpc_channel_init(self._ch, fd, int(is_server), max_streams)
 
     @property
     def stream_count(self) -> int:

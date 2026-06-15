@@ -32,7 +32,10 @@ extern "C" {
  * Tunables
  * -------------------------------------------------------------------------- */
 
+#ifndef BRPC_MAX_STREAMS
 #define BRPC_MAX_STREAMS            256
+#endif
+
 #define BRPC_DEFAULT_WINDOW_SIZE    65536
 #define BRPC_DEFAULT_STREAM_BUF_SIZE 16384
 
@@ -47,19 +50,19 @@ typedef struct brpc_channel {
     int fd;                              /**< Underlying socket descriptor.    */
 
     /* ---- stream table ---- */
-    brpc_stream_t streams[BRPC_MAX_STREAMS];
-    int           stream_count;          /**< Number of active streams.        */
-    uint32_t      next_stream_id;        /**< Next ID to assign.              */
-    int           is_server;             /**< Non-zero ⇒ we use even IDs.     */
+    brpc_stream_t *streams;              /**< Heap-allocated stream array.     */
+    uint32_t       max_streams;          /**< Capacity of streams array.       */
+    int            stream_count;         /**< Number of active streams.        */
+    uint32_t       next_stream_id;       /**< Next ID to assign.              */
+    int            is_server;            /**< Non-zero ⇒ we use even IDs.     */
 
     /* ---- connection receive buffer ---- */
-    uint8_t      *conn_buf;              /**< Heap-allocated accumulation buf. */
-    size_t        conn_buf_size;         /**< Allocated size.                  */
-    size_t        conn_buf_len;          /**< Valid bytes currently buffered.  */
+    uint8_t       *conn_buf;             /**< Heap-allocated accumulation buf. */
+    size_t         conn_buf_size;        /**< Allocated size.                  */
+    size_t         conn_buf_len;         /**< Valid bytes currently buffered.  */
 
     /* ---- negotiated settings ---- */
-    uint32_t      max_concurrent_streams;
-    uint32_t      initial_window_size;
+    uint32_t       initial_window_size;
 
     /* ---- callbacks ---- */
 
@@ -83,10 +86,12 @@ typedef struct brpc_channel {
 /**
  * Initialise a channel over an already-connected socket `fd`.
  * `is_server` selects the stream-ID parity (server = even, client = odd).
+ * `max_streams` sets the maximum number of concurrent streams (0 = BRPC_MAX_STREAMS).
  *
  * @return 0 on success, -1 on allocation failure.
  */
-int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server);
+int brpc_channel_init(brpc_channel_t *ch, int fd, int is_server,
+                      uint32_t max_streams);
 
 /**
  * Tear down the channel.  Destroys all streams and frees the connection
