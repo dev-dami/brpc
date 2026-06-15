@@ -627,6 +627,11 @@ void json_write_arr_end(json_writer_t *w) {
     write_raw(w, "]", 1);
 }
 
+void json_write_raw(json_writer_t *w, const char *s, size_t len) {
+    write_comma_if_needed(w);
+    write_raw(w, s, len);
+}
+
 static void serialize_value(json_writer_t *w, json_value_t *v) {
     if (!v) {
         json_write_null(w);

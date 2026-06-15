@@ -100,4 +100,9 @@ void json_write_obj_end(json_writer_t *w);
 void json_write_arr_start(json_writer_t *w);
 void json_write_arr_end(json_writer_t *w);
 
+/**
+ * Write raw JSON bytes without escaping (for embedding pre-serialized values).
+ */
+void json_write_raw(json_writer_t *w, const char *s, size_t len);
+
 int json_serialize(json_value_t *val, char *buf, size_t buf_len, size_t *out_len);

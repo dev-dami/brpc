@@ -2,6 +2,7 @@
 #include "brpc_frame.h"
 #include "brpc_stream.h"
 #include "brpc_channel.h"
+#include "brpc_rpc.h"
 #include "brpc_prof.h"
 
 #include <stdio.h>
@@ -801,6 +802,174 @@ static void test_json_over_channel(void) {
 }
 
 /* ========================================================================
+ * RPC Tests
+ * ======================================================================== */
+
+static int handler_add(const brpc_rpc_request_t *req,
+                       brpc_rpc_response_t *resp, void *ctx)
+{
+    (void)ctx;
+    (void)req;
+    resp->result = NULL;
+    return BRPC_RPC_OK;
+}
+
+static int handler_echo(const brpc_rpc_request_t *req,
+                        brpc_rpc_response_t *resp, void *ctx)
+{
+    (void)ctx;
+    (void)req;
+    resp->result = NULL;
+    return BRPC_RPC_OK;
+}
+
+static int handler_fail(const brpc_rpc_request_t *req,
+                        brpc_rpc_response_t *resp, void *ctx)
+{
+    (void)req;
+    (void)ctx;
+    resp->error_code = BRPC_RPC_ERROR_INTERNAL;
+    resp->error_message = "Intentional failure";
+    return BRPC_RPC_ERROR_INTERNAL;
+}
+
+static void test_rpc(void)
+{
+    TEST("rpc build request");
+    char buf[512];
+    int len = brpc_rpc_build_request(buf, sizeof(buf), "getUser", "{\"id\":1}", "42");
+    if (len > 0 && strstr(buf, "\"method\":\"getUser\"") && strstr(buf, "\"id\":42")) {
+        PASS();
+    } else { FAIL("build request failed"); }
+
+    TEST("rpc build response");
+    len = brpc_rpc_build_response(buf, sizeof(buf), "42", "{\"name\":\"Alice\"}");
+    if (len > 0 && strstr(buf, "\"result\":") && strstr(buf, "\"id\":42")) {
+        PASS();
+    } else { FAIL("build response failed"); }
+
+    TEST("rpc build error");
+    len = brpc_rpc_build_error(buf, sizeof(buf), "1", -32601, "Method not found");
+    if (len > 0 && strstr(buf, "\"code\":-32601") && strstr(buf, "Method not found")) {
+        PASS();
+    } else { FAIL("build error failed"); }
+
+    TEST("rpc server init");
+    brpc_rpc_server_t srv;
+    brpc_rpc_server_init(&srv);
+    if (srv.method_count == 0) {
+        PASS();
+    } else { FAIL("init failed"); }
+
+    TEST("rpc register method");
+    brpc_rpc_register(&srv, "add", handler_add, NULL);
+    brpc_rpc_register(&srv, "echo", handler_echo, NULL);
+    brpc_rpc_register(&srv, "fail", handler_fail, NULL);
+    if (srv.method_count == 3) {
+        PASS();
+    } else { FAIL("register failed"); }
+
+    TEST("rpc dispatch request");
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    brpc_channel_t ch;
+    brpc_channel_init(&ch, sv[0], 0, 0);
+    brpc_stream_t *cs = brpc_channel_open_stream(&ch);
+
+    const char *req = "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":\"hello\",\"id\":1}";
+    int rc = brpc_rpc_server_dispatch(&srv, &ch, cs->stream_id,
+                                      req, strlen(req));
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("dispatch failed"); }
+
+    TEST("rpc dispatch notification");
+    const char *notif = "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":\"hi\"}";
+    rc = brpc_rpc_server_dispatch(&srv, &ch, cs->stream_id,
+                                  notif, strlen(notif));
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("notification failed"); }
+
+    TEST("rpc dispatch invalid json");
+    const char *bad = "not json";
+    rc = brpc_rpc_server_dispatch(&srv, &ch, cs->stream_id,
+                                  bad, strlen(bad));
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("bad json should return 0"); }
+
+    TEST("rpc dispatch unknown method");
+    const char *unknown = "{\"jsonrpc\":\"2.0\",\"method\":\"nope\",\"id\":1}";
+    rc = brpc_rpc_server_dispatch(&srv, &ch, cs->stream_id,
+                                  unknown, strlen(unknown));
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("unknown method should return 0"); }
+
+    TEST("rpc client init");
+    brpc_rpc_client_t cli;
+    brpc_rpc_client_init(&cli, &ch, cs->stream_id);
+    if (cli.ch == &ch && cli.stream_id == cs->stream_id) {
+        PASS();
+    } else { FAIL("client init failed"); }
+
+    TEST("rpc notify");
+    rc = brpc_rpc_notify(&cli, "echo", "\"ping\"");
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("notify failed"); }
+
+    brpc_channel_destroy(&ch);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Test with real socket pair for call/response. */
+    TEST("rpc full round-trip");
+    int sv2[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv2);
+    brpc_channel_t srv_ch, cli_ch;
+    brpc_channel_init(&srv_ch, sv2[0], 1, 0);
+    brpc_channel_init(&cli_ch, sv2[1], 0, 0);
+
+    brpc_rpc_server_t srv2;
+    brpc_rpc_server_init(&srv2);
+    brpc_rpc_register(&srv2, "ping", handler_echo, NULL);
+
+    brpc_stream_t *cli_s = brpc_channel_open_stream(&cli_ch);
+    brpc_rpc_client_t cli2;
+    brpc_rpc_client_init(&cli2, &cli_ch, cli_s->stream_id);
+
+    /* Client sends request. */
+    const char *ping_req = "{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":10}";
+    brpc_channel_send_data(&cli_ch, cli_s->stream_id,
+                           (const uint8_t *)ping_req, strlen(ping_req), 0);
+
+    /* Server receives and dispatches. */
+    brpc_channel_recv(&srv_ch);
+    /* Find the server-side stream. */
+    brpc_stream_t *srv_s = brpc_channel_find_stream(&srv_ch, cli_s->stream_id);
+    if (srv_s) {
+        char recv_buf[512];
+        size_t avail = brpc_stream_available_read(srv_s);
+        if (avail > 0 && avail < sizeof(recv_buf)) {
+            brpc_stream_read(srv_s, (uint8_t *)recv_buf, avail);
+            recv_buf[avail] = '\0';
+            rc = brpc_rpc_server_dispatch(&srv2, &srv_ch, srv_s->stream_id,
+                                          recv_buf, avail);
+            if (rc == 0) {
+                PASS();
+            } else { FAIL("server dispatch failed"); }
+        } else { FAIL("no data on server stream"); }
+    } else { FAIL("server stream not found"); }
+
+    brpc_channel_destroy(&srv_ch);
+    brpc_channel_destroy(&cli_ch);
+    close(sv2[0]);
+    close(sv2[1]);
+}
+
+/* ========================================================================
  * Main
  * ======================================================================== */
 
@@ -827,6 +996,9 @@ int main(void) {
 
     printf("\n=== Integration Tests ===\n");
     test_json_over_channel();
+
+    printf("\n=== RPC Tests ===\n");
+    test_rpc();
 
     printf("\n--- Results: %d/%d passed ---\n", tests_passed, tests_run);
 

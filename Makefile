@@ -2,7 +2,7 @@ CC ?= zig cc
 CFLAGS = -Wall -Wextra -O2 -Iinclude
 LDFLAGS = -lm
 
-SRC = src/json_hotpath.c src/brpc_frame.c src/brpc_stream.c src/brpc_channel.c src/brpc_prof.c
+SRC = src/json_hotpath.c src/brpc_frame.c src/brpc_stream.c src/brpc_channel.c src/brpc_prof.c src/brpc_rpc.c
 
 .PHONY: all clean test run bench
 

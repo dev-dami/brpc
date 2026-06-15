@@ -10,7 +10,17 @@ When you need bidirectional streaming between services and your payloads are JSO
 2. **Raw TCP + JSON** — simple but no multiplexing, no flow control, no streaming semantics.
 3. **WebSocket** — browser-oriented, text-based framing, limited flow control.
 
-brpc sits between 2 and 3: binary-framed multiplexed streams with JSON payloads, no codegen, no HTTP dependency, ~1800 LOC.
+brpc sits between 2 and 3: binary-framed multiplexed streams with JSON payloads, no codegen, no HTTP dependency, ~2000 LOC.
+
+## What brpc provides
+
+- **Arena-based JSON parsing and serialization** — zero-allocation, ~0.1-2µs per message
+- **Binary framing** — 10-byte LE header per frame (justified: cheaper host encoding on x86/x64)
+- **Multiplexed bidirectional streams** — configurable concurrent streams over one TCP connection
+- **Flow control** — connection and stream receive windows (application-level backpressure callbacks not yet implemented)
+- **JSON-RPC 2.0 abstraction** — request/response, method dispatch, error propagation
+- **Python bindings** — ctypes-based, no codegen needed
+- **Profiling** — microsecond-granularity counters for every hot path
 
 ## When to use this
 
@@ -25,30 +35,70 @@ brpc sits between 2 and 3: binary-framed multiplexed streams with JSON payloads,
 - You need TLS (not implemented yet)
 - You need cross-language interop (currently C + Python only)
 - You need authentication/authorization
-- You need message-level encryption
+- You need message-level compression
+- You need async/event-loop integration (uv, epoll, etc.)
 - You need backward-compatible protocol versioning
 
 These are all real limitations. gRPC solves them out of the box.
 
 ## Quick start
 
-### C
+### RPC (the main API)
+
+**Server:**
+
+```c
+#include "brpc_rpc.h"
+
+// Handler: receives JSON-RPC request, writes response
+int handle_get_user(const brpc_rpc_request_t *req,
+                    brpc_rpc_response_t *resp, void *ctx) {
+    int64_t user_id = json_get_int(json_obj_get(req->params, "id"), 0);
+    // ... look up user ...
+    // resp->result = your_json_value;
+    return BRPC_RPC_OK;
+}
+
+// Set up server
+brpc_rpc_server_t srv;
+brpc_rpc_server_init(&srv);
+brpc_rpc_register(&srv, "getUser", handle_get_user, NULL);
+
+// In your recv loop:
+brpc_rpc_server_dispatch(&srv, &channel, stream_id, recv_buf, recv_len);
+```
+
+**Client:**
+
+```c
+#include "brpc_rpc.h"
+
+brpc_rpc_client_t cli;
+brpc_rpc_client_init(&cli, &channel, stream_id);
+
+// Synchronous call
+char response[4096];
+brpc_rpc_call(&cli, "getUser", "{\"id\":1}", response, sizeof(response));
+
+// Fire-and-forget notification
+brpc_rpc_notify(&cli, "logEvent", "{\"event\":\"click\"}");
+```
+
+### JSON (standalone)
 
 ```c
 #include "json_hotpath.h"
 
-// Parse JSON
+// Parse
 uint8_t arena_buf[4096];
 json_arena_t arena;
 json_arena_init(&arena, arena_buf, sizeof(arena_buf));
-
 json_parser_t p;
 json_value_t *root;
 json_parse(&p, "{\"temp\":23.5}", 13, &arena, &root);
-
 double temp = json_get_float(json_obj_get(root, "temp"), 0);
 
-// Serialize JSON
+// Serialize
 char buf[256];
 json_writer_t w;
 json_writer_init(&w, buf, sizeof(buf));
@@ -56,8 +106,7 @@ json_write_obj_start(&w);
 json_write_obj_key(&w, "temp", 4);
 json_write_float(&w, 23.5);
 json_write_obj_end(&w);
-size_t len = json_writer_finish(&w);
-// buf now contains: {"temp":23.5}
+json_writer_finish(&w);
 ```
 
 ### Python
@@ -68,17 +117,15 @@ from brpc import JsonParser, JsonWriter
 parser = JsonParser()
 v = parser.parse('{"method":"getUser","id":1}')
 print(v["method"].as_str())  # "getUser"
-print(v["id"].as_int())      # 1
 
 writer = JsonWriter()
 writer.obj_start()
 writer.obj_key("method"); writer.str("getUser")
-writer.obj_key("id"); writer.int(1)
 writer.obj_end()
-data = writer.finish()  # b'{"method":"getUser","id":1}'
+data = writer.finish()
 ```
 
-### Channel (bidirectional streaming)
+### Channel (low-level streaming)
 
 ```c
 #include "brpc_channel.h"
@@ -92,13 +139,12 @@ brpc_channel_init(&server, sv[1], 1, 0);  // server
 
 brpc_stream_t *s = brpc_channel_open_stream(&client);
 brpc_channel_send_data(&client, s->stream_id, payload, len, 0);
-
-brpc_channel_recv(&server);  // blocking read, dispatches to streams
+brpc_channel_recv(&server);
 ```
 
 ## Performance
 
-Measured on x86-64 Linux with `zig cc -O2`:
+Measured on x86-64 Linux, `zig cc -O2`, single thread, `socketpair(AF_UNIX)`:
 
 | Operation | Latency | Throughput |
 |-----------|---------|------------|
@@ -122,13 +168,14 @@ Measured on x86-64 Linux with `zig cc -O2`:
 | Medium (99B) | 0.4µs | 4.3µs | 11x |
 | Large (310B) | 2.1µs | 7.6µs | 3.6x |
 
-These are C-level numbers. Python ctypes FFI adds ~2-3µs overhead per call.
+C-level numbers. Python ctypes FFI adds ~2-3µs overhead per call.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                Application                      │
+│              brpc_rpc (JSON-RPC 2.0)            │
+│    Request/response, method dispatch, errors    │
 ├──────────────────┬──────────────────────────────┤
 │   json_hotpath   │        brpc_channel          │
 │  Arena parser +  │  Multiplexed TCP channel     │
@@ -156,6 +203,8 @@ Offset  Size  Field
 10      N     Payload
 ```
 
+Little-endian chosen for cheaper host encoding on x86/x64. May change in v1.
+
 ## Stream lifecycle
 
 ```
@@ -174,14 +223,17 @@ IDLE → OPEN → HALF_CLOSED_LOCAL → CLOSED
 | JSON parse/serialize | Done |
 | Binary framing | Done |
 | Multiplexed streams | Done |
-| Flow control | Done |
+| Connection/stream flow control windows | Done |
+| JSON-RPC 2.0 dispatch | Done |
+| Method registration + handlers | Done |
+| Error propagation | Done |
 | Profiling | Done |
 | Python bindings | Done |
 | TLS | Not implemented |
 | Authentication | Not implemented |
 | Compression | Not implemented |
-| Reconnection | Not implemented |
-| Backpressure signaling | Not implemented |
+| Application-level backpressure callbacks | Not implemented |
+| Async/event-loop integration | Not implemented |
 | Protocol versioning | Not implemented |
 | Cross-language interop | C + Python only |
 
@@ -190,9 +242,10 @@ IDLE → OPEN → HALF_CLOSED_LOCAL → CLOSED
 ### C
 
 ```bash
-make all        # builds brpc_demo and test_brpc
-make test       # runs 67 C tests
+make all        # builds brpc_demo, test_brpc, bench
+make test       # runs 79 C tests
 make run        # runs demo
+make bench      # runs C benchmarks
 ```
 
 ### Python
@@ -201,12 +254,6 @@ make run        # runs demo
 cd python/brpc
 uv sync
 uv run pytest tests/ -v  # 31 Python tests
-```
-
-### Benchmarks
-
-```bash
-make bench      # builds and runs C benchmarks
 ```
 
 ## Project structure
@@ -218,11 +265,12 @@ brpc/
 │   ├── brpc_frame.h      # Binary framing
 │   ├── brpc_stream.h     # Bidirectional stream
 │   ├── brpc_channel.h    # Multiplexed channel
+│   ├── brpc_rpc.h        # JSON-RPC 2.0 abstraction
 │   └── brpc_prof.h       # Profiling
-├── src/                  # Implementation (~1800 LOC)
-├── tests/                # C tests (67 tests)
-├── examples/             # Demo code
+├── src/                  # Implementation (~2000 LOC)
+├── tests/                # C tests (79 tests)
 ├── bench.c               # C benchmarks
+├── examples/             # Demo code
 ├── python/brpc/          # Python package
 │   ├── tests/            # Python tests (31 tests)
 │   └── benchmarks/       # Python benchmarks
