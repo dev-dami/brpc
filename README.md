@@ -1,6 +1,6 @@
 # brpc
 
-A lightweight RPC framework in C with Python bindings, designed for low-latency streaming and efficient JSON messaging.
+A small RPC framework for trusted networks. It provides multiplexed streams, JSON-RPC 2.0, and C/Python bindings with minimal dependencies, prioritizing simplicity and low latency over security features and ecosystem breadth.
 
 > **Security warning**: brpc has no TLS, no authentication, and no encryption.
 > Do not expose brpc services over the public internet.
@@ -269,11 +269,16 @@ Three separate mechanisms:
 - Streams are serviced in order of arrival (FIFO per connection)
 - No round-robin or priority scheduling
 - A flooding stream can delay others on the same connection
+- brpc multiplexes streams but does not guarantee fairness
+- Heavy traffic on one stream may increase latency for other streams sharing the same channel
+- For latency-sensitive workloads, use separate channels
 
 **Stream lifecycle:**
+- Stream ID 0 is reserved and invalid
+- Client streams use odd IDs (1, 3, 5...)
+- Server streams use even IDs (2, 4, 6...)
 - Closed streams never reopen
-- New streams get new IDs (monotonically increasing)
-- Stream IDs follow parity: client=odd, server=even
+- New streams get monotonically increasing IDs
 
 ## Blocking semantics
 
@@ -371,6 +376,8 @@ Measured on AMD Ryzen 7 5800X, Linux 6.x, `zig cc 0.16 -O2`, single thread, `soc
 
 **Memory**: Peak RSS 2MB for all components.
 
+**Methodology**: These are microbenchmarks on a single thread. CPU governor set to `performance`. Median of 10 million iterations per operation. Numbers represent ideal-case throughput and should not be interpreted as production latency under concurrent load.
+
 ## Comparison
 
 | | brpc | gRPC | Raw TCP + JSON |
@@ -421,6 +428,8 @@ Offset  Size  Field
 
 brpc targets homogeneous Linux deployments (x86_64 and aarch64). Cross-platform wire compatibility is not a design goal.
 
+Frame headers are packed and unaligned. Do not cast network buffers directly to struct pointers — use the `brpc_frame_decode()` function instead.
+
 The wire format is experimental until v1.0. A protocol version field will be added before v1.0 release.
 
 ## Roadmap
@@ -440,7 +449,7 @@ v1.0
   - Protocol versioning
   - Backward compatibility guarantees
 
-Future
+Post v1.0
   - Rust bindings
   - Go bindings
   - Async/await support
@@ -459,6 +468,12 @@ A: No. If the stream buffer is full, `brpc_stream_write()` returns 0 bytes writt
 
 **Q: Why JsonValue instead of plain Python types?**
 A: The parser uses zero-copy arena allocation. JsonValue wraps C pointers. RpcServer handlers return plain Python types.
+
+**Q: Can RPC calls be cancelled?**
+A: Not currently. `brpc_rpc_call()` blocks until: response received, transport error, or connection closed. Cancellation APIs are planned post-v1.0.
+
+**Q: What happens on disconnect?**
+A: No automatic reconnect. If a channel closes: all streams fail, pending RPC calls return errors, application creates a new channel. Automatic retries are the application's responsibility.
 
 ## Limitations
 
