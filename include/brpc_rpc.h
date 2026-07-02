@@ -2,7 +2,7 @@
  * brpc_rpc.h — JSON-RPC 2.0 Abstraction Layer
  *
  * Provides request/response semantics on top of brpc_channel streams.
- * Compatible with the JSON-RPC 2.0 specification.
+ * Compatible with the JSON-RPC 2.0 specification, including batched requests.
  *
  * Usage (server):
  *   brpc_rpc_server_t srv;
@@ -125,9 +125,12 @@ void brpc_rpc_set_default(brpc_rpc_server_t *srv,
  * Dispatch an incoming JSON-RPC message on a stream.
  *
  * Parses the JSON, finds the method, calls the handler, and sends
- * the response back on the same stream.
+ * the response back on the same stream. If the message is a JSON-RPC
+ * batch array, all requests are handled in one parse/dispatch pass and
+ * non-notification responses are returned as a single JSON array.
  *
- * For notifications (no id), no response is sent.
+ * For notifications (no id), no response is sent. Notification-only
+ * batches also produce no response.
  *
  * @param stream    The stream that received the message.
  * @param data      Raw JSON-RPC message bytes.
@@ -156,6 +159,12 @@ typedef struct brpc_rpc_client {
     brpc_channel_t *ch;
     uint32_t stream_id;
 } brpc_rpc_client_t;
+
+typedef struct brpc_rpc_batch_item {
+    const char *method;  /**< Method name. */
+    const char *params;  /**< JSON-encoded params string, or NULL. */
+    const char *id;      /**< Request ID; NULL makes this item a notification. */
+} brpc_rpc_batch_item_t;
 
 /**
  * Initialize an RPC client on an existing channel/stream.
@@ -190,6 +199,33 @@ int brpc_rpc_call(brpc_rpc_client_t *cli, const char *method,
 int brpc_rpc_call_timeout(brpc_rpc_client_t *cli, const char *method,
                           const char *params, char *resp_buf, size_t buf_len,
                           int timeout_ms);
+
+/**
+ * Send a JSON-RPC batch and wait for the aggregated response.
+ *
+ * Items with a NULL id are notifications and are omitted from the
+ * response by compliant servers. If every item is a notification, use
+ * brpc_rpc_notify_batch() instead because no response is expected.
+ *
+ * @return 0 on success, BRPC_RPC_ERROR_TIMEOUT on timeout,
+ *         negative error code on other failure.
+ */
+int brpc_rpc_call_batch_timeout(brpc_rpc_client_t *cli,
+                                const brpc_rpc_batch_item_t *items,
+                                size_t item_count,
+                                char *resp_buf, size_t buf_len,
+                                int timeout_ms);
+
+/**
+ * Send a JSON-RPC notification batch (no response expected).
+ *
+ * Each item is sent without an id regardless of the id value in items.
+ *
+ * @return 0 on success.
+ */
+int brpc_rpc_notify_batch(brpc_rpc_client_t *cli,
+                          const brpc_rpc_batch_item_t *items,
+                          size_t item_count);
 
 /**
  * Call a remote method with json_value_t params (ergonomic API).
@@ -243,6 +279,17 @@ int brpc_rpc_cancel(brpc_rpc_client_t *cli);
 int brpc_rpc_build_request(char *buf, size_t buf_len,
                            const char *method, const char *params,
                            const char *id);
+
+/**
+ * Build a JSON-RPC batch request string.
+ *
+ * @param items      Batch entries to serialize.
+ * @param item_count Number of entries in items.
+ * @return Bytes written, or -1 on error.
+ */
+int brpc_rpc_build_batch_request(char *buf, size_t buf_len,
+                                 const brpc_rpc_batch_item_t *items,
+                                 size_t item_count);
 
 /**
  * Build a JSON-RPC success response string.

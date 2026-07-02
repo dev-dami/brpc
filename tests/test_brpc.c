@@ -901,6 +901,19 @@ static void test_rpc(void)
         PASS();
     } else { FAIL("build error failed"); }
 
+    TEST("rpc build batch request");
+    brpc_rpc_batch_item_t batch_items[] = {
+        { "getUser", "{\"id\":1}", "1" },
+        { "notify", "{\"ok\":true}", NULL }
+    };
+    len = brpc_rpc_build_batch_request(buf, sizeof(buf), batch_items, 2);
+    if (len > 0 && buf[0] == '[' &&
+        strstr(buf, "\"method\":\"getUser\"") &&
+        strstr(buf, "\"method\":\"notify\"") &&
+        strstr(buf, "\"id\":1")) {
+        PASS();
+    } else { FAIL("build batch request failed"); }
+
     TEST("rpc server init");
     brpc_rpc_server_t srv;
     brpc_rpc_server_init(&srv);
@@ -954,6 +967,18 @@ static void test_rpc(void)
         PASS();
     } else { FAIL("unknown method should return 0"); }
 
+    TEST("rpc dispatch batch request");
+    const char *batch = "["
+        "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"id\":2},"
+        "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":\"notify\"},"
+        "{\"jsonrpc\":\"2.0\",\"method\":\"nope\",\"id\":3}"
+        "]";
+    rc = brpc_rpc_server_dispatch(&srv, &ch, cs->stream_id,
+                                  batch, strlen(batch));
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("batch dispatch failed"); }
+
     TEST("rpc client init");
     brpc_rpc_client_t cli;
     brpc_rpc_client_init(&cli, &ch, cs->stream_id);
@@ -966,6 +991,16 @@ static void test_rpc(void)
     if (rc == 0) {
         PASS();
     } else { FAIL("notify failed"); }
+
+    TEST("rpc notify batch");
+    brpc_rpc_batch_item_t notify_items[] = {
+        { "echo", "\"ping\"", "100" },
+        { "echo", "\"pong\"", "101" }
+    };
+    rc = brpc_rpc_notify_batch(&cli, notify_items, 2);
+    if (rc == 0) {
+        PASS();
+    } else { FAIL("notify batch failed"); }
 
     brpc_channel_destroy(&ch);
     close(sv[0]);

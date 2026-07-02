@@ -56,19 +56,131 @@ static brpc_rpc_method_t *find_method(brpc_rpc_server_t *srv,
     return NULL;
 }
 
+
+static int write_rpc_id(json_value_t *id, char *id_str, size_t id_str_len)
+{
+    if (!id_str || id_str_len == 0) return -1;
+
+    if (id && id->type == JSON_INT) {
+        snprintf(id_str, id_str_len, "%lld", (long long)id->i);
+    } else if (id && id->type == JSON_STRING) {
+        json_writer_t w;
+        json_writer_init(&w, id_str, id_str_len);
+        json_write_str(&w, id->str.ptr, id->str.len);
+        if (json_writer_finish(&w) == 0 || w.error) return -1;
+    } else {
+        if (id_str_len < 5) return -1;
+        strcpy(id_str, "null");
+    }
+    return 0;
+}
+
+static int build_dispatch_response(brpc_rpc_server_t *srv, json_value_t *root,
+                                   char *resp_buf, size_t resp_buf_len,
+                                   int *has_response)
+{
+    *has_response = 0;
+
+    if (!root || root->type != JSON_OBJECT) {
+        int len = brpc_rpc_build_error(resp_buf, resp_buf_len, "null",
+                                       BRPC_RPC_ERROR_INVALID,
+                                       "Request must be a JSON object");
+        if (len > 0) *has_response = 1;
+        return len;
+    }
+
+    json_value_t *method_val = json_obj_get(root, "method");
+    if (!method_val || method_val->type != JSON_STRING) {
+        int len = brpc_rpc_build_error(resp_buf, resp_buf_len, "null",
+                                       BRPC_RPC_ERROR_INVALID,
+                                       "Missing or invalid 'method' field");
+        if (len > 0) *has_response = 1;
+        return len;
+    }
+
+    json_value_t *params = json_obj_get(root, "params");
+    json_value_t *id = json_obj_get(root, "id");
+    int is_notification = (id == NULL || id->type == JSON_NULL);
+
+    brpc_rpc_request_t req;
+    req.method = method_val->str.ptr;
+    req.method_len = method_val->str.len;
+    req.params = params;
+    req.id = id;
+    req.is_notification = is_notification;
+
+    brpc_rpc_method_t *m = find_method(srv, req.method, req.method_len);
+    brpc_rpc_handler_fn handler = NULL;
+    void *handler_ctx = NULL;
+
+    if (m) {
+        handler = m->handler;
+        handler_ctx = m->user_ctx;
+    } else if (srv->default_handler) {
+        handler = srv->default_handler;
+        handler_ctx = srv->default_ctx;
+    } else {
+        if (is_notification) return 0;
+
+        char method_name[128];
+        size_t copy_len = req.method_len < sizeof(method_name) - 1
+                          ? req.method_len : sizeof(method_name) - 1;
+        memcpy(method_name, req.method, copy_len);
+        method_name[copy_len] = '\0';
+
+        char errmsg[256];
+        snprintf(errmsg, sizeof(errmsg), "Method '%s' not found", method_name);
+
+        int len = brpc_rpc_build_error(resp_buf, resp_buf_len, "null",
+                                       BRPC_RPC_ERROR_METHOD, errmsg);
+        if (len > 0) *has_response = 1;
+        return len;
+    }
+
+    brpc_rpc_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.id = id;
+
+    int rc = handler(&req, &resp, handler_ctx);
+    if (is_notification) return 0;
+
+    char id_str[128];
+    if (write_rpc_id(id, id_str, sizeof(id_str)) != 0) strcpy(id_str, "null");
+
+    int len;
+    if (rc != 0 || resp.error_code != 0) {
+        int err_code = resp.error_code ? resp.error_code : rc;
+        const char *err_msg = resp.error_message ? resp.error_message : "Internal error";
+        len = brpc_rpc_build_error(resp_buf, resp_buf_len,
+                                   id_str, err_code, err_msg);
+    } else {
+        char result_json[2048];
+        size_t result_len = 0;
+        if (resp.result) {
+            json_serialize(resp.result, result_json, sizeof(result_json), &result_len);
+        } else {
+            strcpy(result_json, "null");
+            result_len = 4;
+        }
+        len = brpc_rpc_build_response(resp_buf, resp_buf_len,
+                                      id_str, result_json);
+    }
+
+    if (len > 0) *has_response = 1;
+    return len;
+}
+
 int brpc_rpc_server_dispatch(brpc_rpc_server_t *srv,
                              brpc_channel_t *ch, uint32_t stream_id,
                              const char *data, size_t data_len)
 {
     uint64_t _t0 = BRPC_PROF_NOW();
 
-    /* Parse the JSON-RPC request. */
     json_arena_reset(&srv->arena);
     json_parser_t p;
     json_value_t *root = NULL;
 
     if (json_parse(&p, data, data_len, &srv->arena, &root) != 0) {
-        /* Parse error — send error response. */
         char resp[256];
         int len = brpc_rpc_build_error(resp, sizeof(resp), "null",
                                        BRPC_RPC_ERROR_PARSE, p.error);
@@ -79,135 +191,41 @@ int brpc_rpc_server_dispatch(brpc_rpc_server_t *srv,
         return 0;
     }
 
-    if (!root || root->type != JSON_OBJECT) {
-        char resp[256];
-        int len = brpc_rpc_build_error(resp, sizeof(resp), "null",
-                                       BRPC_RPC_ERROR_INVALID,
-                                       "Request must be a JSON object");
-        if (len > 0) {
-            brpc_channel_send_data(ch, stream_id, (const uint8_t *)resp,
-                                   (size_t)len, 0);
-        }
-        return 0;
-    }
+    if (root && root->type == JSON_ARRAY) {
+        char batch_buf[8192];
+        json_writer_t w;
+        json_writer_init(&w, batch_buf, sizeof(batch_buf));
+        json_write_arr_start(&w);
+        int response_count = 0;
 
-    /* Extract method. */
-    json_value_t *method_val = json_obj_get(root, "method");
-    if (!method_val || method_val->type != JSON_STRING) {
-        char resp[256];
-        int len = brpc_rpc_build_error(resp, sizeof(resp), "null",
-                                       BRPC_RPC_ERROR_INVALID,
-                                       "Missing or invalid 'method' field");
-        if (len > 0) {
-            brpc_channel_send_data(ch, stream_id, (const uint8_t *)resp,
-                                   (size_t)len, 0);
-        }
-        return 0;
-    }
-
-    /* Extract params (optional). */
-    json_value_t *params = json_obj_get(root, "params");
-
-    /* Extract id (NULL for notifications). */
-    json_value_t *id = json_obj_get(root, "id");
-    int is_notification = (id == NULL || id->type == JSON_NULL);
-
-    /* Build request struct. */
-    brpc_rpc_request_t req;
-    req.method = method_val->str.ptr;
-    req.method_len = method_val->str.len;
-    req.params = params;
-    req.id = id;
-    req.is_notification = is_notification;
-
-    /* Find handler. */
-    brpc_rpc_method_t *m = find_method(srv, req.method, req.method_len);
-
-    brpc_rpc_handler_fn handler;
-    void *handler_ctx;
-
-    if (m) {
-        handler = m->handler;
-        handler_ctx = m->user_ctx;
-    } else if (srv->default_handler) {
-        handler = srv->default_handler;
-        handler_ctx = srv->default_ctx;
-    } else {
-        /* Method not found. */
-        if (!is_notification) {
-            char resp[256];
-            char method_name[128];
-            size_t copy_len = req.method_len < sizeof(method_name) - 1
-                              ? req.method_len : sizeof(method_name) - 1;
-            memcpy(method_name, req.method, copy_len);
-            method_name[copy_len] = '\0';
-
-            char errmsg[256];
-            snprintf(errmsg, sizeof(errmsg), "Method '%s' not found", method_name);
-
-            int len = brpc_rpc_build_error(resp, sizeof(resp), "null",
-                                           BRPC_RPC_ERROR_METHOD, errmsg);
-            if (len > 0) {
-                brpc_channel_send_data(ch, stream_id, (const uint8_t *)resp,
-                                       (size_t)len, 0);
+        for (size_t i = 0; i < root->arr.count; i++) {
+            char item_resp[4096];
+            int has_response = 0;
+            int len = build_dispatch_response(srv, root->arr.items[i],
+                                              item_resp, sizeof(item_resp),
+                                              &has_response);
+            if (len > 0 && has_response) {
+                json_write_raw(&w, item_resp, (size_t)len);
+                response_count++;
             }
         }
+        json_write_arr_end(&w);
+        size_t batch_len = json_writer_finish(&w);
+        if (response_count > 0 && batch_len > 0 && !w.error) {
+            brpc_channel_send_data(ch, stream_id, (const uint8_t *)batch_buf,
+                                   batch_len, 0);
+        }
+        BRPC_PROF_RECORD("rpc_dispatch", BRPC_PROF_NOW() - _t0, data_len);
         return 0;
     }
 
-    /* Call handler. */
-    brpc_rpc_response_t resp;
-    memset(&resp, 0, sizeof(resp));
-    resp.id = id;
-
-    int rc = handler(&req, &resp, handler_ctx);
-
-    /* Send response (skip for notifications). */
-    if (!is_notification) {
-        char resp_buf[4096];
-
-        /* Build the id string for the response. */
-        char id_str[64];
-        if (id && id->type == JSON_INT) {
-            snprintf(id_str, sizeof(id_str), "%lld", (long long)id->i);
-        } else if (id && id->type == JSON_STRING) {
-            size_t copy_len = id->str.len < sizeof(id_str) - 1
-                              ? id->str.len : sizeof(id_str) - 1;
-            memcpy(id_str, id->str.ptr, copy_len);
-            id_str[copy_len] = '\0';
-            /* Wrap in quotes for JSON. */
-            memmove(id_str + 1, id_str, copy_len + 1);
-            id_str[0] = '"';
-            id_str[copy_len + 1] = '"';
-            id_str[copy_len + 2] = '\0';
-        } else {
-            strcpy(id_str, "null");
-        }
-
-        int len;
-        if (rc != 0 || resp.error_code != 0) {
-            int err_code = resp.error_code ? resp.error_code : rc;
-            const char *err_msg = resp.error_message ? resp.error_message : "Internal error";
-            len = brpc_rpc_build_error(resp_buf, sizeof(resp_buf),
-                                       id_str, err_code, err_msg);
-        } else {
-            /* Serialize result to JSON. */
-            char result_json[2048];
-            size_t result_len = 0;
-            if (resp.result) {
-                json_serialize(resp.result, result_json, sizeof(result_json), &result_len);
-            } else {
-                strcpy(result_json, "null");
-                result_len = 4;
-            }
-            len = brpc_rpc_build_response(resp_buf, sizeof(resp_buf),
-                                           id_str, result_json);
-        }
-
-        if (len > 0) {
-            brpc_channel_send_data(ch, stream_id, (const uint8_t *)resp_buf,
-                                   (size_t)len, 0);
-        }
+    char resp_buf[4096];
+    int has_response = 0;
+    int len = build_dispatch_response(srv, root, resp_buf, sizeof(resp_buf),
+                                      &has_response);
+    if (len > 0 && has_response) {
+        brpc_channel_send_data(ch, stream_id, (const uint8_t *)resp_buf,
+                               (size_t)len, 0);
     }
 
     BRPC_PROF_RECORD("rpc_dispatch", BRPC_PROF_NOW() - _t0, data_len);
@@ -277,7 +295,7 @@ int brpc_rpc_call(brpc_rpc_client_t *cli, const char *method,
     if (!s) return -1;
 
     size_t available = brpc_stream_available_read(s);
-    if (available == 0 || available > buf_len) return -1;
+    if (available == 0 || available >= buf_len) return -1;
 
     int n = brpc_stream_read(s, (uint8_t *)resp_buf, available);
     if (n <= 0) return -1;
@@ -361,7 +379,7 @@ int brpc_rpc_call_timeout(brpc_rpc_client_t *cli, const char *method,
             continue;
         }
 
-        if (available > buf_len) return -1;
+        if (available >= buf_len) return -1;
 
         int n = brpc_stream_read(s, (uint8_t *)resp_buf, available);
         if (n <= 0) return -1;
@@ -369,6 +387,107 @@ int brpc_rpc_call_timeout(brpc_rpc_client_t *cli, const char *method,
         resp_buf[n] = '\0';
         return 0;
     }
+}
+
+int brpc_rpc_call_batch_timeout(brpc_rpc_client_t *cli,
+                                const brpc_rpc_batch_item_t *items,
+                                size_t item_count,
+                                char *resp_buf, size_t buf_len,
+                                int timeout_ms)
+{
+    char req_buf[8192];
+    int req_len = brpc_rpc_build_batch_request(req_buf, sizeof(req_buf),
+                                               items, item_count);
+    if (req_len < 0) return -1;
+
+    int rc = brpc_channel_send_data(cli->ch, cli->stream_id,
+                                    (const uint8_t *)req_buf,
+                                    (size_t)req_len, 0);
+    if (rc != 0) return -1;
+
+    struct pollfd pfd;
+    pfd.fd = cli->ch->fd;
+    pfd.events = POLLIN;
+
+    int remaining_ms = timeout_ms;
+    uint64_t deadline = 0;
+
+    if (timeout_ms > 0) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        deadline = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL
+                   + (uint64_t)timeout_ms;
+    }
+
+    for (;;) {
+        int poll_rc = poll(&pfd, 1, remaining_ms);
+        if (poll_rc < 0) {
+            if (errno == EINTR) {
+                if (timeout_ms > 0) {
+                    struct timeval tv;
+                    gettimeofday(&tv, NULL);
+                    uint64_t now = (uint64_t)tv.tv_sec * 1000ULL
+                                   + (uint64_t)tv.tv_usec / 1000ULL;
+                    if (now >= deadline) return BRPC_RPC_ERROR_TIMEOUT;
+                    remaining_ms = (int)(deadline - now);
+                }
+                continue;
+            }
+            return -1;
+        }
+        if (poll_rc == 0) return BRPC_RPC_ERROR_TIMEOUT;
+
+        rc = brpc_channel_recv(cli->ch);
+        if (rc != 0) return -1;
+
+        brpc_stream_t *s = brpc_channel_find_stream(cli->ch, cli->stream_id);
+        if (!s) return -1;
+
+        size_t available = brpc_stream_available_read(s);
+        if (available == 0) {
+            if (timeout_ms > 0) {
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                uint64_t now = (uint64_t)tv.tv_sec * 1000ULL
+                               + (uint64_t)tv.tv_usec / 1000ULL;
+                if (now >= deadline) return BRPC_RPC_ERROR_TIMEOUT;
+                remaining_ms = (int)(deadline - now);
+            }
+            continue;
+        }
+
+        if (available >= buf_len) return -1;
+
+        int n = brpc_stream_read(s, (uint8_t *)resp_buf, available);
+        if (n <= 0) return -1;
+
+        resp_buf[n] = '\0';
+        return 0;
+    }
+}
+
+int brpc_rpc_notify_batch(brpc_rpc_client_t *cli,
+                          const brpc_rpc_batch_item_t *items,
+                          size_t item_count)
+{
+    if (!items || item_count == 0) return -1;
+
+    brpc_rpc_batch_item_t notify_items[64];
+    if (item_count > sizeof(notify_items) / sizeof(notify_items[0])) return -1;
+
+    for (size_t i = 0; i < item_count; i++) {
+        notify_items[i] = items[i];
+        notify_items[i].id = NULL;
+    }
+
+    char req_buf[8192];
+    int req_len = brpc_rpc_build_batch_request(req_buf, sizeof(req_buf),
+                                               notify_items, item_count);
+    if (req_len < 0) return -1;
+
+    return brpc_channel_send_data(cli->ch, cli->stream_id,
+                                  (const uint8_t *)req_buf,
+                                  (size_t)req_len, 0);
 }
 
 int brpc_rpc_call_json(brpc_rpc_client_t *cli, const char *method,
@@ -491,6 +610,44 @@ int brpc_rpc_build_request(char *buf, size_t buf_len,
 
     json_write_obj_end(&w);
     return (int)json_writer_finish(&w);
+}
+
+int brpc_rpc_build_batch_request(char *buf, size_t buf_len,
+                                 const brpc_rpc_batch_item_t *items,
+                                 size_t item_count)
+{
+    if (!items || item_count == 0) return -1;
+
+    json_writer_t w;
+    json_writer_init(&w, buf, buf_len);
+
+    json_write_arr_start(&w);
+    for (size_t i = 0; i < item_count; i++) {
+        if (!items[i].method) return -1;
+
+        json_write_obj_start(&w);
+        json_write_obj_key(&w, "jsonrpc", 7);
+        json_write_str(&w, "2.0", 3);
+
+        json_write_obj_key(&w, "method", 6);
+        json_write_str(&w, items[i].method, strlen(items[i].method));
+
+        if (items[i].params) {
+            json_write_obj_key(&w, "params", 6);
+            json_write_raw(&w, items[i].params, strlen(items[i].params));
+        }
+
+        if (items[i].id) {
+            json_write_obj_key(&w, "id", 2);
+            json_write_raw(&w, items[i].id, strlen(items[i].id));
+        }
+        json_write_obj_end(&w);
+    }
+    json_write_arr_end(&w);
+
+    size_t len = json_writer_finish(&w);
+    if (len == 0 || w.error) return -1;
+    return (int)len;
 }
 
 int brpc_rpc_build_response(char *buf, size_t buf_len,
