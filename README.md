@@ -41,14 +41,14 @@ JSON is generally slower and larger than Protobuf, but:
 - Dynamic payloads without codegen
 - Familiar to Python and JavaScript developers
 
-brpc prioritizes simplicity and flexibility over maximum serialization efficiency.
+brpc prioritizes simplicity and flexibility over maximum serialization efficiency. To close some of the gap with heavier RPC stacks, the RPC layer supports JSON-RPC batch arrays so callers can coalesce many logical RPCs into one stream write and one aggregated response frame.
 
 ## Mental model
 
 - **Channel**: One TCP connection that multiplexes many streams
 - **Stream**: A bidirectional message pipe within a channel
 - **Frame**: A 10-byte binary header + payload, the unit sent over the wire
-- **RPC layer**: JSON-RPC 2.0 on top of streams — method dispatch, handlers, errors
+- **RPC layer**: JSON-RPC 2.0 on top of streams — method dispatch, handlers, errors, batched calls
 
 Data flow: `RPC handler → JSON serialize → Stream → Frame → TCP`
 
@@ -189,6 +189,13 @@ brpc_rpc_server_poll(&srv, &ch);  /* recv + dispatch all streams */
 
 /* Client */
 brpc_rpc_call_timeout(&cli, "method", params_json, buf, sizeof(buf), 1000);
+
+brpc_rpc_batch_item_t batch[] = {
+    {"getUser", "{\"id\":1}", "1"},
+    {"audit", "{\"event\":\"seen\"}", NULL},  /* notification */
+};
+brpc_rpc_call_batch_timeout(&cli, batch, 2, buf, sizeof(buf), 1000);
+brpc_rpc_notify_batch(&cli, batch, 2);
 brpc_rpc_cancel(&cli);
 ```
 
