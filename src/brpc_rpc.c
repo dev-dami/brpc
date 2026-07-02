@@ -131,7 +131,10 @@ static int build_dispatch_response(brpc_rpc_server_t *srv, json_value_t *root,
         char errmsg[256];
         snprintf(errmsg, sizeof(errmsg), "Method '%s' not found", method_name);
 
-        int len = brpc_rpc_build_error(resp_buf, resp_buf_len, "null",
+        char id_str[128];
+        if (write_rpc_id(id, id_str, sizeof(id_str)) != 0) strcpy(id_str, "null");
+
+        int len = brpc_rpc_build_error(resp_buf, resp_buf_len, id_str,
                                        BRPC_RPC_ERROR_METHOD, errmsg);
         if (len > 0) *has_response = 1;
         return len;
@@ -157,13 +160,20 @@ static int build_dispatch_response(brpc_rpc_server_t *srv, json_value_t *root,
         char result_json[2048];
         size_t result_len = 0;
         if (resp.result) {
-            json_serialize(resp.result, result_json, sizeof(result_json), &result_len);
+            if (json_serialize(resp.result, result_json, sizeof(result_json), &result_len) != 0) {
+                len = brpc_rpc_build_error(resp_buf, resp_buf_len, id_str,
+                                           BRPC_RPC_ERROR_INTERNAL,
+                                           "failed to serialize result");
+            } else {
+                len = brpc_rpc_build_response(resp_buf, resp_buf_len,
+                                              id_str, result_json);
+            }
         } else {
             strcpy(result_json, "null");
             result_len = 4;
+            len = brpc_rpc_build_response(resp_buf, resp_buf_len,
+                                          id_str, result_json);
         }
-        len = brpc_rpc_build_response(resp_buf, resp_buf_len,
-                                      id_str, result_json);
     }
 
     if (len > 0) *has_response = 1;
@@ -192,11 +202,20 @@ int brpc_rpc_server_dispatch(brpc_rpc_server_t *srv,
     }
 
     if (root && root->type == JSON_ARRAY) {
-        char batch_buf[8192];
-        json_writer_t w;
-        json_writer_init(&w, batch_buf, sizeof(batch_buf));
-        json_write_arr_start(&w);
-        int response_count = 0;
+        /* Collect all item responses first. */
+        typedef struct {
+            char *data;
+            size_t len;
+        } item_response_t;
+
+        item_response_t *responses = malloc(root->arr.count * sizeof(item_response_t));
+        if (!responses) {
+            BRPC_PROF_RECORD("rpc_dispatch", BRPC_PROF_NOW() - _t0, data_len);
+            return 0;
+        }
+
+        size_t response_count = 0;
+        size_t total_size = 0;
 
         for (size_t i = 0; i < root->arr.count; i++) {
             char item_resp[4096];
@@ -205,16 +224,54 @@ int brpc_rpc_server_dispatch(brpc_rpc_server_t *srv,
                                               item_resp, sizeof(item_resp),
                                               &has_response);
             if (len > 0 && has_response) {
-                json_write_raw(&w, item_resp, (size_t)len);
+                responses[response_count].data = malloc((size_t)len);
+                if (!responses[response_count].data) {
+                    /* Cleanup and exit on allocation failure. */
+                    for (size_t j = 0; j < response_count; j++) {
+                        free(responses[j].data);
+                    }
+                    free(responses);
+                    BRPC_PROF_RECORD("rpc_dispatch", BRPC_PROF_NOW() - _t0, data_len);
+                    return 0;
+                }
+                memcpy(responses[response_count].data, item_resp, (size_t)len);
+                responses[response_count].len = (size_t)len;
+                total_size += (size_t)len;
                 response_count++;
             }
         }
-        json_write_arr_end(&w);
-        size_t batch_len = json_writer_finish(&w);
-        if (response_count > 0 && batch_len > 0 && !w.error) {
-            brpc_channel_send_data(ch, stream_id, (const uint8_t *)batch_buf,
-                                   batch_len, 0);
+
+        if (response_count > 0) {
+            /* Allocate batch buffer to fit all responses plus JSON array syntax. */
+            size_t batch_capacity = total_size + 128;  /* Extra space for array brackets, commas, etc. */
+            char *batch_buf = malloc(batch_capacity);
+            if (batch_buf) {
+                json_writer_t w;
+                json_writer_init(&w, batch_buf, batch_capacity);
+                json_write_arr_start(&w);
+
+                for (size_t i = 0; i < response_count; i++) {
+                    json_write_raw(&w, responses[i].data, responses[i].len);
+                }
+
+                json_write_arr_end(&w);
+                size_t batch_len = json_writer_finish(&w);
+
+                if (batch_len > 0 && !w.error) {
+                    brpc_channel_send_data(ch, stream_id, (const uint8_t *)batch_buf,
+                                           batch_len, 0);
+                }
+
+                free(batch_buf);
+            }
         }
+
+        /* Cleanup all responses. */
+        for (size_t i = 0; i < response_count; i++) {
+            free(responses[i].data);
+        }
+        free(responses);
+
         BRPC_PROF_RECORD("rpc_dispatch", BRPC_PROF_NOW() - _t0, data_len);
         return 0;
     }
@@ -472,8 +529,18 @@ int brpc_rpc_notify_batch(brpc_rpc_client_t *cli,
 {
     if (!items || item_count == 0) return -1;
 
-    brpc_rpc_batch_item_t notify_items[64];
-    if (item_count > sizeof(notify_items) / sizeof(notify_items[0])) return -1;
+    /* Use stack allocation for small batches, heap for larger ones. */
+    brpc_rpc_batch_item_t stack_items[64];
+    brpc_rpc_batch_item_t *notify_items = NULL;
+    int need_free = 0;
+
+    if (item_count <= 64) {
+        notify_items = stack_items;
+    } else {
+        notify_items = malloc(item_count * sizeof(brpc_rpc_batch_item_t));
+        if (!notify_items) return -1;
+        need_free = 1;
+    }
 
     for (size_t i = 0; i < item_count; i++) {
         notify_items[i] = items[i];
@@ -483,6 +550,11 @@ int brpc_rpc_notify_batch(brpc_rpc_client_t *cli,
     char req_buf[8192];
     int req_len = brpc_rpc_build_batch_request(req_buf, sizeof(req_buf),
                                                notify_items, item_count);
+
+    if (need_free) {
+        free(notify_items);
+    }
+
     if (req_len < 0) return -1;
 
     return brpc_channel_send_data(cli->ch, cli->stream_id,

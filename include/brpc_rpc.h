@@ -163,7 +163,7 @@ typedef struct brpc_rpc_client {
 typedef struct brpc_rpc_batch_item {
     const char *method;  /**< Method name. */
     const char *params;  /**< JSON-encoded params string, or NULL. */
-    const char *id;      /**< Request ID; NULL makes this item a notification. */
+    const char *id;      /**< Request ID as raw JSON literal (e.g., "\"abc\"" or "42"); written as-is into JSON output. NULL makes this item a notification. */
 } brpc_rpc_batch_item_t;
 
 /**
